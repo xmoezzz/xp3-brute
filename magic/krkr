@@ -1,0 +1,19 @@
+# KiriKiri / TVP private formats.
+# Standard libmagic syntax. Compiled into the Rust binary by magic-embed and
+# evaluated by pure-magic; no C libmagic binding or runtime magic.mgc is used.
+
+0	string	TVP\ pre-rendered\ font	KiriKiri/TVP pre-rendered font
+!:mime	application/x-kirikiri-prerendered-font
+!:ext	tft
+>21	byte	0x1a	\b, binary marker
+>22	byte	0	\b, version 0
+>22	byte	1	\b, version 1
+>23	byte	2	\b, 16-bit Unicode
+
+# KiriKiri TJS ns0/4s0 binary encoded scripts (.pbd)
+0	string	TJS/ns0\000	KiriKiri TJS ns0 binary encoded script
+!:mime	application/x-kirikiri-pbd
+!:ext	pbd
+0	string	TJS/4s0\000	KiriKiri TJS 4s0 binary encoded script
+!:mime	application/x-kirikiri-pbd
+!:ext	pbd

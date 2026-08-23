@@ -1,0 +1,52 @@
+[package]
+name = "xp3-brute"
+version = "0.3.7"
+edition = "2021"
+description = "Offline XP3 parser and brute-force recovery library/CLI"
+license = "MIT"
+rust-version = "1.88"
+
+[lib]
+name = "xp3_brute"
+path = "src/lib.rs"
+
+[[bin]]
+name = "xp3brute"
+path = "src/main.rs"
+
+[features]
+default = ["gpu", "magic-sniff"]
+gpu = ["dep:wgpu", "dep:pollster"]
+magic-sniff = ["dep:pure-magic", "dep:magic-db", "dep:magic-embed"]
+
+[dependencies]
+aes = "0.8"
+flate2 = "1.0"
+rayon = "1.10"
+encoding_rs = "0.8"
+chacha20poly1305 = "0.10"
+pelite = "0.10.0"
+unicorn-engine = "2.1.5"
+sha3 = "0.10"
+blake2 = "0.10.6"
+argon2 = "0.5.3"
+tjs2dec = "0.4.0"
+tlg-rs = "0.1.1"
+libtlg-rs = { version = "0.2.4", features = ["encode"] }
+emote-psb = "0.8.0"
+eluna_rs = "0.1.0"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp"] }
+amv_decoder = { git = "https://github.com/xmoezzz/amv_decoder", rev = "38e46ee40745a26813881720a63afc7f679460b9" }
+serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+base64 = "0.22"
+sha2 = "0.10"
+lz4_flex = "0.14"
+xxhash-rust = { version = "0.8", features = ["xxh32"] }
+wgpu = { version = "0.19.4", optional = true }
+pollster = { version = "0.3.0", optional = true }
+
+pure-magic = { version = "0.3.3", optional = true }
+magic-db = { version = "0.5.3", optional = true }
+magic-embed = { version = "0.4.3", optional = true }
