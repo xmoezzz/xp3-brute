@@ -20,6 +20,7 @@ jobs:
   build-linux:
     name: Build Linux x86_64 (glibc 2.17)
     runs-on: ubuntu-24.04
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -28,6 +29,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           docker run --rm \
             -v "$PWD:/work" \
             -w /work \
@@ -36,28 +38,42 @@ jobs:
             quay.io/pypa/manylinux2014_x86_64 \
             /bin/bash -lc '
               set -euo pipefail
+
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --default-toolchain 1.88.0
+                | sh -s -- -y --profile minimal --default-toolchain 1.92.0
+
               source /tmp/cargo/env
+
               rustc --version
               ldd --version | head -1
-              cargo build --locked --release --bin xp3brute --target x86_64-unknown-linux-gnu
-              ./target/x86_64-unknown-linux-gnu/release/xp3brute --help >/dev/null
+
+              cargo build \
+                --locked \
+                --release \
+                --bin xp3brute \
+                --target x86_64-unknown-linux-gnu
             '
 
       - name: Verify glibc requirement
         shell: bash
         run: |
           set -euo pipefail
+
           binary=target/x86_64-unknown-linux-gnu/release/xp3brute
-          max_glibc="$({ readelf --version-info "$binary" || true; } \
+
+          max_glibc="$({
+            readelf --version-info "$binary" || true
+          } \
             | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)*' \
             | sed 's/^GLIBC_//' \
             | sort -Vu \
             | tail -1 || true)"
+
           echo "highest referenced GLIBC version: ${max_glibc:-none}"
+
           if [[ -n "$max_glibc" ]]; then
             highest="$(printf '%s\n' 2.17 "$max_glibc" | sort -V | tail -1)"
+
             if [[ "$highest" != "2.17" ]]; then
               echo "Linux binary requires GLIBC_$max_glibc; expected GLIBC_2.17 or older" >&2
               exit 1
@@ -68,16 +84,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             build_id="$GITHUB_REF_NAME"
           else
             build_id="manual-${GITHUB_SHA:0:7}"
           fi
+
           target=x86_64-unknown-linux-gnu
           package="xp3brute-${build_id}-${target}"
+
           mkdir -p "$package"
           cp "target/${target}/release/xp3brute" "$package/"
           cp README.md THIRD_PARTY_NOTICES.md "$package/"
+
           tar -czf "${package}.tar.gz" "$package"
 
       - name: Upload Linux artifact
@@ -90,6 +110,7 @@ jobs:
 
   build-native:
     name: Build ${{ matrix.name }}
+
     strategy:
       fail-fast: false
       matrix:
@@ -98,19 +119,22 @@ jobs:
             os: macos-15
             target: aarch64-apple-darwin
             archive: tar.gz
+
           - name: Windows x86_64
             os: windows-2025
             target: x86_64-pc-windows-msvc
             archive: zip
+
     runs-on: ${{ matrix.os }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Rust 1.88
+      - name: Install Rust 1.92
         uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.88.0
+          toolchain: 1.92.0
           targets: ${{ matrix.target }}
 
       - name: Cache Rust build
@@ -128,15 +152,19 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
+
           if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
             build_id="$GITHUB_REF_NAME"
           else
             build_id="manual-${GITHUB_SHA:0:7}"
           fi
+
           package="xp3brute-${build_id}-${TARGET}"
+
           mkdir -p "$package"
           cp "target/${TARGET}/release/xp3brute" "$package/"
           cp README.md THIRD_PARTY_NOTICES.md "$package/"
+
           tar -czf "${package}.tar.gz" "$package"
 
       - name: Package Windows binary
@@ -145,12 +173,20 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
         run: |
-          $buildId = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "manual-$($env:GITHUB_SHA.Substring(0, 7))" }
+          $buildId = if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $env:GITHUB_REF_NAME
+          } else {
+            "manual-$($env:GITHUB_SHA.Substring(0, 7))"
+          }
+
           $package = "xp3brute-$buildId-$env:TARGET"
+
           New-Item -ItemType Directory -Path $package -Force | Out-Null
+
           Copy-Item "target/$env:TARGET/release/xp3brute.exe" "$package/"
           Copy-Item README.md "$package/"
           Copy-Item THIRD_PARTY_NOTICES.md "$package/"
+
           Compress-Archive -Path "$package/*" -DestinationPath "$package.zip" -Force
 
       - name: Upload build artifact
@@ -164,10 +200,13 @@ jobs:
   publish:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
+
     needs:
       - build-linux
       - build-native
+
     runs-on: ubuntu-24.04
+
     steps:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -180,6 +219,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           cd dist
           sha256sum xp3brute-* > SHA256SUMS
           cat SHA256SUMS
@@ -191,6 +231,7 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
