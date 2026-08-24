@@ -613,9 +613,7 @@ impl LegacyCxdecFilter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let normalized = crate::pe_normalize::normalize_pe_file(path)?;
-        let bytes = normalized.bytes;
-        let pe = PeImage::parse(&bytes)?;
-        let probe = probe_bytes(path, &bytes, &pe);
+        let (bytes, pe, probe) = probe_with_static_self_decode(path, normalized.bytes)?;
         if !probe.recognized {
             return Err(Error::unsupported(format!(
                 "{} is not a recognized native CXDEC generator module (confidence={}, reasons={})",
@@ -1215,12 +1213,11 @@ fn parse_generated_lane(
 pub fn probe_legacy_cxdec_module(path: impl AsRef<Path>) -> Result<LegacyCxdecProbe> {
     let path = path.as_ref();
     let normalized = crate::pe_normalize::normalize_pe_file(path)?;
-    let bytes = normalized.bytes;
-    let pe = PeImage::parse(&bytes)?;
-    // Known-family detection is intentionally static. DllMain/V2Link execution
-    // belongs to the reverse/oracle tooling and must not turn an otherwise
-    // incomplete profile into a production NativeRust result.
-    Ok(probe_bytes(path, &bytes, &pe))
+    // Known-family detection remains static.  Deterministic self-decoding
+    // wrappers are unfolded as data transformations only after their output
+    // proves the classic generator semantics; no DllMain/V2Link code executes.
+    let (_, _, probe) = probe_with_static_self_decode(path, normalized.bytes)?;
+    Ok(probe)
 }
 
 /// Byte-backed static probe used for PE images embedded in a game executable.
@@ -1231,9 +1228,8 @@ pub fn probe_legacy_cxdec_bytes(
 ) -> Result<LegacyCxdecProbe> {
     let label = label.as_ref();
     let normalized = crate::pe_normalize::normalize_pe_bytes(raw_bytes)?;
-    let bytes = normalized.bytes;
-    let pe = PeImage::parse(&bytes)?;
-    Ok(probe_bytes(label, &bytes, &pe))
+    let (_, _, probe) = probe_with_static_self_decode(label, normalized.bytes)?;
+    Ok(probe)
 }
 
 /// Probe disk PE files and structurally extracted embedded PE modules around a
@@ -1405,6 +1401,7 @@ struct ModuleParamFacts {
     random_seeds: Vec<u32>,
     riddle_prefix8: bool,
     setup_archive_data_generator: bool,
+    v2link: bool,
 }
 
 /// Scan every PE around a game executable/directory and combine CXDEC
@@ -1422,7 +1419,6 @@ fn collect_module_param_facts(source: PathBuf, raw_bytes: &[u8]) -> Option<Modul
 
     let callback = find_callback_config(&bytes, &pe);
     let dynamic_xcode = find_classic_dynamic_xcode(&bytes, &pe);
-    let boundary = find_classic_boundary_params(&bytes, &pe);
     let control_blocks = find_control_block_file_offsets(&bytes, &pe)
         .into_iter()
         .filter_map(|off| pe.file_offset_to_rva(off as u32))
@@ -1430,6 +1426,17 @@ fn collect_module_param_facts(source: PathBuf, raw_bytes: &[u8]) -> Option<Modul
         .map(|value| value.to_vec())
         .collect::<Vec<_>>();
     let classic = contains_u32(&bytes, XCODE_LCG_MUL) && contains_u32(&bytes, XCODE_LCG_ADD);
+    let boundary = find_classic_boundary_params(&bytes, &pe).or_else(|| {
+        // Some early builds compute `(hash & mask) + offset` directly in the
+        // extraction filter instead of materializing an object with boundary
+        // fields at +4/+8.  Only enable the direct form after independent
+        // classic-CXDEC and control-table evidence is already present.
+        if classic && !control_blocks.is_empty() {
+            find_classic_direct_boundary_params(&bytes, &pe)
+        } else {
+            None
+        }
+    });
     let cabbage_rva = find_cabbage_prng_window(&bytes, &pe);
     let riddle_prefix8 = find_riddle_prefix8_window(&bytes, &pe).is_some();
     let setup_archive_data_generator =
@@ -1474,7 +1481,245 @@ fn collect_module_param_facts(source: PathBuf, raw_bytes: &[u8]) -> Option<Modul
         random_seeds,
         riddle_prefix8,
         setup_archive_data_generator,
+        v2link: contains_bytes(&bytes, b"V2Link\0"),
     })
+}
+
+#[derive(Clone, Debug)]
+struct StaticCxdecSelfDecode {
+    initialized_file: Vec<u8>,
+    section_rva: u32,
+    seed: u32,
+}
+
+fn collect_x86_mov_push_immediates(bytes: &[u8], pe: &PeImage) -> Vec<u32> {
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+    const MAX_SEEDS: usize = 4096;
+
+    let mut out = Vec::new();
+    // The clear bootstrap normally lives in an RX section while the encoded
+    // program storage is writable/executable.  Prefer immediates from RX code
+    // so random bytes in the encoded section do not flood the seed set.
+    for prefer_non_writable in [true, false] {
+        for section in &pe.sections {
+            if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+                continue;
+            }
+            if prefer_non_writable && section.characteristics & IMAGE_SCN_MEM_WRITE != 0 {
+                continue;
+            }
+            let start = section.raw_offset as usize;
+            let size = section.raw_size as usize;
+            let Some(end) = start.checked_add(size) else {
+                continue;
+            };
+            let Some(code) = bytes.get(start..end.min(bytes.len())) else {
+                continue;
+            };
+            let mut i = 0usize;
+            while i + 5 <= code.len() {
+                let op = code[i];
+                if (0xb8..=0xbf).contains(&op) || op == 0x68 {
+                    let value = u32::from_le_bytes([
+                        code[i + 1],
+                        code[i + 2],
+                        code[i + 3],
+                        code[i + 4],
+                    ]);
+                    if !out.contains(&value) {
+                        out.push(value);
+                        if out.len() >= MAX_SEEDS {
+                            out.sort_by_key(|value| {
+                                if *value <= 0xffff {
+                                    0u8
+                                } else if *value <= 0x00ff_ffff {
+                                    1u8
+                                } else {
+                                    2u8
+                                }
+                            });
+                            return out;
+                        }
+                    }
+                }
+                i += 1;
+            }
+        }
+        if !out.is_empty() {
+            break;
+        }
+    }
+    out.sort_by_key(|value| {
+        if *value <= 0xffff {
+            0u8
+        } else if *value <= 0x00ff_ffff {
+            1u8
+        } else {
+            2u8
+        }
+    });
+    out
+}
+
+#[inline]
+fn legacy_decc_bitperm_state(old: u32) -> u32 {
+    // Algebraic form of the shift/add state transition emitted by this CXDEC
+    // bootstrap family.  Keeping it as one wrapping multiply is independent of
+    // compiler register allocation and instruction scheduling.
+    old.wrapping_mul(12_869)
+        .wrapping_add(0x1b01)
+        ^ (old >> 3)
+}
+
+#[inline]
+fn legacy_decc_bitperm_byte(value: u8, mode: u32) -> u8 {
+    match mode & 3 {
+        0 => value.rotate_left(1),
+        1 => ((value & 0x55) << 1) | ((value >> 1) & 0x55),
+        2 => value.rotate_left(4),
+        _ => ((value & 0x33) << 2) | ((value >> 2) & 0x33),
+    }
+}
+
+fn decode_legacy_decc_bitperm_region(input: &[u8], seed: u32) -> Vec<u8> {
+    let mut state = seed;
+    let mut out = Vec::with_capacity(input.len());
+    for &byte in input {
+        state = legacy_decc_bitperm_state(state);
+        out.push(legacy_decc_bitperm_byte(byte, state));
+    }
+    out
+}
+
+fn try_static_cxdec_self_decode(raw_bytes: &[u8]) -> Option<StaticCxdecSelfDecode> {
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    const IMAGE_SCN_MEM_WRITE: u32 = 0x8000_0000;
+    const PROBE_LIMIT: usize = 256 * 1024;
+
+    let normalized = crate::pe_normalize::normalize_pe_bytes(raw_bytes).ok()?;
+    let bytes = normalized.bytes;
+    let pe = PeImage::parse(&bytes).ok()?;
+    if pe.machine != 0x014c {
+        return None;
+    }
+    // This path exists specifically for the state where the on-disk image does
+    // not expose the classic generator yet.  Never transform an already-clear
+    // CXDEC implementation.
+    if contains_u32(&bytes, XCODE_LCG_MUL) && contains_u32(&bytes, XCODE_LCG_ADD) {
+        return None;
+    }
+
+    let seeds = collect_x86_mov_push_immediates(&bytes, &pe);
+    if seeds.is_empty() {
+        return None;
+    }
+
+    // Prefer writable/executable storage, but allow any executable section as
+    // a fallback.  The decoded candidate is accepted only if it reveals both
+    // exact classic-CXDEC LCG constants, so section names are not identity.
+    for require_write in [true, false] {
+        for section in &pe.sections {
+            if section.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+                continue;
+            }
+            if require_write && section.characteristics & IMAGE_SCN_MEM_WRITE == 0 {
+                continue;
+            }
+            let start = section.raw_offset as usize;
+            let stored = section.raw_size as usize;
+            let semantic = if section.virtual_size == 0 {
+                stored
+            } else {
+                (section.virtual_size as usize).min(stored)
+            };
+            if semantic == 0 || start >= bytes.len() {
+                continue;
+            }
+            let available = semantic.min(bytes.len() - start);
+            if available == 0 {
+                continue;
+            }
+            let probe_len = available.min(PROBE_LIMIT);
+            let probe = &bytes[start..start + probe_len];
+
+            for &seed in &seeds {
+                let decoded_probe = decode_legacy_decc_bitperm_region(probe, seed);
+                if !contains_u32(&decoded_probe, XCODE_LCG_MUL)
+                    || !contains_u32(&decoded_probe, XCODE_LCG_ADD)
+                {
+                    continue;
+                }
+
+                let decoded = decode_legacy_decc_bitperm_region(
+                    &bytes[start..start + available],
+                    seed,
+                );
+                let mut initialized_file = bytes.clone();
+                initialized_file[start..start + available].copy_from_slice(&decoded);
+                return Some(StaticCxdecSelfDecode {
+                    initialized_file,
+                    section_rva: section.virtual_address,
+                    seed,
+                });
+            }
+        }
+        // Do not try the same writable/executable section twice after a proof
+        // was found; reaching here means no candidate in this preference pass.
+    }
+    None
+}
+
+
+fn probe_with_static_self_decode(
+    path: &Path,
+    normalized_bytes: Vec<u8>,
+) -> Result<(Vec<u8>, PeImage, LegacyCxdecProbe)> {
+    let pe = PeImage::parse(&normalized_bytes)?;
+    let probe = probe_bytes(path, &normalized_bytes, &pe);
+    if probe.recognized
+        || probe.control_block_rva.is_none()
+        || !contains_bytes(&normalized_bytes, b"V2Link\0")
+    {
+        return Ok((normalized_bytes, pe, probe));
+    }
+
+    let Some(decoded) = try_static_cxdec_self_decode(&normalized_bytes) else {
+        return Ok((normalized_bytes, pe, probe));
+    };
+    let decoded_pe = PeImage::parse(&decoded.initialized_file)?;
+    let mut decoded_probe = probe_bytes(path, &decoded.initialized_file, &decoded_pe);
+    if !decoded_probe.recognized {
+        return Ok((normalized_bytes, pe, probe));
+    }
+    decoded_probe.profile_name = "cxdec-cxencryption-bitperm-v1";
+    decoded_probe.reasons.push(format!(
+        "self-decoding CXDEC executable storage recovered statically: section_rva=0x{:x} seed=0x{:x}; decoded code proves classic LCG semantics",
+        decoded.section_rva, decoded.seed
+    ));
+    Ok((decoded.initialized_file, decoded_pe, decoded_probe))
+}
+
+fn needs_runtime_cxdec_initialization(fact: &ModuleParamFacts) -> bool {
+    // A file-backed CXDEC control block plus the KiriKiri plugin entry point is
+    // strong structural evidence.  Older CxEncryption TPMs can keep the
+    // generator itself encoded until DLL initialization, so absence of the LCG,
+    // boundary constructor or 3/8/6 dispatch in the on-disk image is exactly
+    // the condition in which a bounded initialization snapshot is useful.
+    fact.v2link
+        && !fact.control_blocks.is_empty()
+        && (!fact.classic || fact.mask_offset.is_none() || fact.dispatch.is_empty())
+}
+
+fn runtime_fact_improves_static(
+    static_fact: &ModuleParamFacts,
+    runtime_fact: &ModuleParamFacts,
+) -> bool {
+    (!static_fact.classic && runtime_fact.classic)
+        || (static_fact.mask_offset.is_none() && runtime_fact.mask_offset.is_some())
+        || (static_fact.dispatch.is_empty() && !runtime_fact.dispatch.is_empty())
+        || (!static_fact.cabbage && runtime_fact.cabbage)
+        || (!static_fact.riddle_prefix8 && runtime_fact.riddle_prefix8)
 }
 
 fn collect_game_module_param_facts(path: &Path) -> Result<Vec<ModuleParamFacts>> {
@@ -1491,8 +1736,107 @@ fn collect_game_module_param_facts(path: &Path) -> Result<Vec<ModuleParamFacts>>
             Err(_) => continue,
         };
 
-        if let Some(fact) = collect_module_param_facts(module.clone(), &raw) {
-            facts.push(fact);
+        if let Some(static_fact) = collect_module_param_facts(module.clone(), &raw) {
+            let needs_initialization = needs_runtime_cxdec_initialization(&static_fact);
+            facts.push(static_fact.clone());
+
+            if needs_initialization {
+                let mut best_fact = static_fact.clone();
+
+                // Some early CxEncryption modules keep the generator in a
+                // deterministic bit-permuted executable section.  Recover that
+                // layer statically first: it is both smaller and more reliable
+                // than running an arbitrary DLL initializer, and acceptance is
+                // proven by the two exact classic-CXDEC LCG constants appearing
+                // in the decoded code.
+                match try_static_cxdec_self_decode(&raw) {
+                    Some(decoded) => {
+                        let source = PathBuf::from(format!(
+                            "{}[self-decode:legacy-bitperm-v1]",
+                            module.display()
+                        ));
+                        if let Some(decoded_fact) =
+                            collect_module_param_facts(source, &decoded.initialized_file)
+                        {
+                            if runtime_fact_improves_static(&static_fact, &decoded_fact) {
+                                eprintln!(
+                                    "[cxdec-decc    ] module={} route=legacy-bitperm-v1 section_rva=0x{:x} seed=0x{:x} classic={} mask_offset={} dispatch={}",
+                                    module.display(),
+                                    decoded.section_rva,
+                                    decoded.seed,
+                                    decoded_fact.classic,
+                                    decoded_fact.mask_offset.is_some(),
+                                    decoded_fact.dispatch.len(),
+                                );
+                                best_fact = decoded_fact.clone();
+                                facts.push(decoded_fact);
+                            } else {
+                                eprintln!(
+                                    "[cxdec-decc    ] module={} route=legacy-bitperm-v1 status=no-new-cxdec-facts",
+                                    module.display()
+                                );
+                            }
+                        } else {
+                            eprintln!(
+                                "[cxdec-decc    ] module={} route=legacy-bitperm-v1 status=decoded-image-unrecognized",
+                                module.display()
+                            );
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "[cxdec-decc    ] module={} route=legacy-bitperm-v1 status=no-proof",
+                            module.display()
+                        );
+                    }
+                }
+
+                // Keep the bounded Unicorn initializer as a fallback for other
+                // self-modifying CXDEC wrappers.  Do not run it when the static
+                // self-decode already exposed every native field we need.
+                if needs_runtime_cxdec_initialization(&best_fact) {
+                    match crate::x86_filter::initialize_x86_module_for_static_analysis(&module) {
+                        Ok(snapshots) => {
+                            for snapshot in snapshots {
+                                if snapshot.changed_executable_bytes == 0 {
+                                    continue;
+                                }
+                                let source = PathBuf::from(format!(
+                                    "{}[{}]",
+                                    module.display(),
+                                    snapshot.stage
+                                ));
+                                let Some(runtime_fact) = collect_module_param_facts(
+                                    source,
+                                    &snapshot.initialized_file,
+                                ) else {
+                                    continue;
+                                };
+                                if runtime_fact_improves_static(&best_fact, &runtime_fact) {
+                                    eprintln!(
+                                        "[cxdec-init    ] module={} stage={} changed_exec={} classic={} mask_offset={} dispatch={}",
+                                        module.display(),
+                                        snapshot.stage,
+                                        snapshot.changed_executable_bytes,
+                                        runtime_fact.classic,
+                                        runtime_fact.mask_offset.is_some(),
+                                        runtime_fact.dispatch.len(),
+                                    );
+                                    best_fact = runtime_fact.clone();
+                                    facts.push(runtime_fact);
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            eprintln!(
+                                "[cxdec-init    ] module={} status=failed error={}",
+                                module.display(),
+                                err
+                            );
+                        }
+                    }
+                }
+            }
         }
 
         // Riddle-era executables can store the real CXDEC module as a zlib
@@ -1500,8 +1844,90 @@ fn collect_game_module_param_facts(path: &Path) -> Result<Vec<ModuleParamFacts>>
         // structurally valid embedded PE exactly like a disk PE.
         for embedded in crate::embedded_pe::extract_embedded_pe_modules_from_bytes(&module, &raw) {
             let source = PathBuf::from(embedded.label());
-            if let Some(fact) = collect_module_param_facts(source, &embedded.bytes) {
-                facts.push(fact);
+            if let Some(static_fact) = collect_module_param_facts(source.clone(), &embedded.bytes) {
+                let needs_initialization = needs_runtime_cxdec_initialization(&static_fact);
+                facts.push(static_fact.clone());
+
+                if needs_initialization {
+                    let mut best_fact = static_fact.clone();
+                    match try_static_cxdec_self_decode(&embedded.bytes) {
+                        Some(decoded) => {
+                            let decoded_source = PathBuf::from(format!(
+                                "{}[self-decode:legacy-bitperm-v1]",
+                                source.display()
+                            ));
+                            if let Some(decoded_fact) = collect_module_param_facts(
+                                decoded_source,
+                                &decoded.initialized_file,
+                            ) {
+                                if runtime_fact_improves_static(&static_fact, &decoded_fact) {
+                                    eprintln!(
+                                        "[cxdec-decc    ] module={} route=legacy-bitperm-v1 section_rva=0x{:x} seed=0x{:x} classic={} mask_offset={} dispatch={}",
+                                        source.display(),
+                                        decoded.section_rva,
+                                        decoded.seed,
+                                        decoded_fact.classic,
+                                        decoded_fact.mask_offset.is_some(),
+                                        decoded_fact.dispatch.len(),
+                                    );
+                                    best_fact = decoded_fact.clone();
+                                    facts.push(decoded_fact);
+                                }
+                            }
+                        }
+                        None => {
+                            eprintln!(
+                                "[cxdec-decc    ] module={} route=legacy-bitperm-v1 status=no-proof",
+                                source.display()
+                            );
+                        }
+                    }
+
+                    if needs_runtime_cxdec_initialization(&best_fact) {
+                        match crate::x86_filter::initialize_x86_module_bytes_for_static_analysis(
+                            &embedded.bytes,
+                        ) {
+                            Ok(snapshots) => {
+                                for snapshot in snapshots {
+                                    if snapshot.changed_executable_bytes == 0 {
+                                        continue;
+                                    }
+                                    let runtime_source = PathBuf::from(format!(
+                                        "{}[{}]",
+                                        source.display(),
+                                        snapshot.stage
+                                    ));
+                                    let Some(runtime_fact) = collect_module_param_facts(
+                                        runtime_source,
+                                        &snapshot.initialized_file,
+                                    ) else {
+                                        continue;
+                                    };
+                                    if runtime_fact_improves_static(&best_fact, &runtime_fact) {
+                                        eprintln!(
+                                            "[cxdec-init    ] module={} stage={} changed_exec={} classic={} mask_offset={} dispatch={}",
+                                            source.display(),
+                                            snapshot.stage,
+                                            snapshot.changed_executable_bytes,
+                                            runtime_fact.classic,
+                                            runtime_fact.mask_offset.is_some(),
+                                            runtime_fact.dispatch.len(),
+                                        );
+                                        best_fact = runtime_fact.clone();
+                                        facts.push(runtime_fact);
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "[cxdec-init    ] module={} status=failed error={}",
+                                    source.display(),
+                                    err
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -1918,8 +2344,9 @@ fn find_dispatch_tables(
                     valid = false;
                     break;
                 }
-                let block = &bytes[target_off..block_end];
-                let Some(semantic) = classify_dispatch_block(block, kind) else {
+                let Some(semantic) =
+                    classify_dispatch_target(bytes, pe, target_off, block_end, kind)
+                else {
                     valid = false;
                     break;
                 };
@@ -2054,7 +2481,7 @@ fn find_prolog_branch_dispatches(
                     .min(target.saturating_add(160))
                     .min(end);
                 let Some(semantic) =
-                    classify_dispatch_block(&bytes[target..block_end], DispatchKind::Prolog)
+                    classify_dispatch_target(bytes, pe, target, block_end, DispatchKind::Prolog)
                 else {
                     valid = false;
                     break;
@@ -2092,6 +2519,96 @@ fn is_permutation(values: &[u8], count: usize) -> bool {
         seen[index] = true;
     }
     true
+}
+
+
+fn classify_dispatch_target(
+    bytes: &[u8],
+    pe: &PeImage,
+    target_off: usize,
+    primary_end: usize,
+    kind: DispatchKind,
+) -> Option<u8> {
+    let primary_end = primary_end.min(bytes.len());
+    if target_off >= primary_end {
+        return None;
+    }
+    let primary = &bytes[target_off..primary_end];
+    if let Some(value) = classify_dispatch_block(primary, kind) {
+        return Some(value);
+    }
+
+    // MSVC often shares an emission tail between two switch cases.  In that
+    // form a case block contains the first opcode bytes and then a conditional
+    // or unconditional branch to the common tail.  Looking only at the linear
+    // bytes between adjacent jump-table targets loses half of the semantic
+    // signature (for example NEG needs F7/D8 plus the shared push 01).
+    // Follow only direct, nearby branches and keep the original block bytes in
+    // front, so classification remains tied to this switch case.
+    let origin_rva = pe.file_offset_to_rva(target_off as u32)?;
+    let mut expanded = primary.to_vec();
+    let scan_end = primary_end.min(target_off.saturating_add(160));
+    let mut off = target_off;
+    let mut followed = 0usize;
+    while off < scan_end && followed < 8 {
+        let decoded: Option<(usize, i32)> = match bytes[off] {
+            0xeb if off + 1 < scan_end => Some((2, bytes[off + 1] as i8 as i32)),
+            0x70..=0x7f if off + 1 < scan_end => {
+                Some((2, bytes[off + 1] as i8 as i32))
+            }
+            0xe9 if off + 4 < scan_end => Some((
+                5,
+                i32::from_le_bytes(bytes[off + 1..off + 5].try_into().ok()?),
+            )),
+            0x0f if off + 5 < scan_end && (0x80..=0x8f).contains(&bytes[off + 1]) => {
+                Some((
+                    6,
+                    i32::from_le_bytes(bytes[off + 2..off + 6].try_into().ok()?),
+                ))
+            }
+            _ => None,
+        };
+        let Some((len, rel)) = decoded else {
+            off += 1;
+            continue;
+        };
+        let branch_rva = pe.file_offset_to_rva(off as u32)?;
+        let target = i64::from(branch_rva) + len as i64 + i64::from(rel);
+        let Ok(branch_target_rva) = u32::try_from(target) else {
+            off += len;
+            continue;
+        };
+        if branch_target_rva.abs_diff(origin_rva) > 0x4000 {
+            off += len;
+            continue;
+        }
+        let Some(branch_target_off) = pe
+            .rva_to_file_offset(branch_target_rva)
+            .map(|value| value as usize)
+        else {
+            off += len;
+            continue;
+        };
+        if branch_target_off >= target_off && branch_target_off < primary_end {
+            off += len;
+            continue;
+        }
+        // Shared emission tails are tiny; keep this window deliberately short
+        // so bytes from the next physical switch case cannot dominate the
+        // semantic classifier.
+        let tail_end = branch_target_off
+            .saturating_add(24)
+            .min(bytes.len());
+        if branch_target_off < tail_end {
+            expanded.extend_from_slice(&bytes[branch_target_off..tail_end]);
+            followed += 1;
+            if let Some(value) = classify_dispatch_block(&expanded, kind) {
+                return Some(value);
+            }
+        }
+        off += len;
+    }
+    None
 }
 
 fn classify_dispatch_block(bytes: &[u8], kind: DispatchKind) -> Option<u8> {
@@ -2428,9 +2945,7 @@ pub fn recover_static_cxdec_profile(
 ) -> Result<Option<crate::cxdec_classic::CxdecProfile>> {
     let path = path.as_ref();
     let normalized = crate::pe_normalize::normalize_pe_file(path)?;
-    let bytes = normalized.bytes;
-    let pe = PeImage::parse(&bytes)?;
-    let probe = probe_bytes(path, &bytes, &pe);
+    let (bytes, pe, probe) = probe_with_static_self_decode(path, normalized.bytes)?;
     if !probe.recognized {
         return Ok(None);
     }
@@ -3263,6 +3778,78 @@ fn tiny_pointer_return(bytes: &[u8], off: usize) -> Option<u32> {
 /// The recognizer requires the same register to be stored at object+4, masked,
 /// incremented by the offset, and stored at object+8. This avoids accepting
 /// unrelated `AND reg,imm; ADD reg,imm` arithmetic elsewhere in the module.
+
+/// Recover the boundary expression from an extraction filter that computes it
+/// in-place rather than storing precomputed fields in a helper object.
+///
+/// This deliberately has a narrow contract: callers only use it after the same
+/// PE already proves the classic generator and a file-backed 4096-byte control
+/// table.  Within executable code we then require `AND reg, imm32` followed by
+/// `ADD` of another bounded immediate to the *same* register.  Distinct pairs
+/// are treated as ambiguous instead of guessed.
+fn find_classic_direct_boundary_params(
+    bytes: &[u8],
+    pe: &PeImage,
+) -> Option<BoundaryParamsEvidence> {
+    let mut found: Option<BoundaryParamsEvidence> = None;
+    for section in &pe.sections {
+        if section.characteristics & 0x2000_0000 == 0 {
+            continue;
+        }
+        let start = section.raw_offset as usize;
+        let end = start
+            .saturating_add(section.raw_size as usize)
+            .min(bytes.len());
+        if end <= start + 12 {
+            continue;
+        }
+
+        for and_off in start..end.saturating_sub(12) {
+            if bytes[and_off] != 0x81 {
+                continue;
+            }
+            let modrm = bytes[and_off + 1];
+            // 81 /4, register-direct: AND r32, imm32.
+            if (modrm & 0xf8) != 0xe0 {
+                continue;
+            }
+            let reg = modrm & 7;
+            let mask = u32::from_le_bytes(bytes[and_off + 2..and_off + 6].try_into().ok()?);
+            if mask == 0 || mask > 0x00ff_ffff {
+                continue;
+            }
+
+            let search_end = and_off.saturating_add(40).min(end);
+            for add_off in and_off + 6..search_end.saturating_sub(5) {
+                // 81 /0 on the same register: ADD r32, imm32.
+                if bytes[add_off] != 0x81 || bytes[add_off + 1] != (0xc0 | reg) {
+                    continue;
+                }
+                let offset =
+                    u32::from_le_bytes(bytes[add_off + 2..add_off + 6].try_into().ok()?);
+                if offset == 0 || offset > 0x00ff_ffff {
+                    continue;
+                }
+                let rva = pe.file_offset_to_rva(and_off as u32)?;
+                let candidate = BoundaryParamsEvidence { rva, mask, offset };
+                match found {
+                    None => found = Some(candidate),
+                    Some(previous)
+                        if previous.mask == candidate.mask
+                            && previous.offset == candidate.offset =>
+                    {
+                        if candidate.rva < previous.rva {
+                            found = Some(candidate);
+                        }
+                    }
+                    Some(_) => return None,
+                }
+            }
+        }
+    }
+    found
+}
+
 fn find_classic_boundary_params(bytes: &[u8], pe: &PeImage) -> Option<BoundaryParamsEvidence> {
     let mut found: Option<BoundaryParamsEvidence> = None;
     for section in &pe.sections {
@@ -3449,11 +4036,17 @@ fn probe_bytes(path: &Path, bytes: &[u8], pe: &PeImage) -> LegacyCxdecProbe {
         }
     }
 
-    let boundary = find_classic_boundary_params(bytes, pe);
+    let boundary = find_classic_boundary_params(bytes, pe).or_else(|| {
+        if has_lcg_mul && has_lcg_add && control_block_rva.is_some() {
+            find_classic_direct_boundary_params(bytes, pe)
+        } else {
+            None
+        }
+    });
     if let Some(value) = boundary {
         score += 24;
         reasons.push(format!(
-            "content boundary constructor rva=0x{:x} mask=0x{:x} offset=0x{:x}",
+            "content boundary expression rva=0x{:x} mask=0x{:x} offset=0x{:x}",
             value.rva, value.mask, value.offset
         ));
     }

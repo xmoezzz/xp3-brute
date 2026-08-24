@@ -229,6 +229,7 @@ impl FilterSession {
 pub fn generation_from_probe(probe: &crate::CxdecProbe) -> CxdecGeneration {
     match probe.profile() {
         "cxdec-legacy-decc-v1" => CxdecGeneration::Classic,
+        "cxdec-cxencryption-bitperm-v1" => CxdecGeneration::CxEncryption,
         // Semantically identified by the 128-lane runtime xcode manager,
         // classic LCG, file-backed 4096-byte control table and split-boundary
         // constructor. The label describes the algorithm generation; no

@@ -528,6 +528,7 @@ fn unknown_stack_bytes(name: &str) -> u16 {
         "InterlockedDecrement"
         | "InterlockedIncrement"
         | "CloseHandle"
+        | "FindClose"
         | "SetLastError"
         | "SetUnhandledExceptionFilter"
         | "ExitProcess"
@@ -548,9 +549,18 @@ fn unknown_stack_bytes(name: &str) -> u16 {
         | "SetEndOfFile"
         | "IsValidCodePage"
         | "IsDBCSLeadByte" => 4,
-        "TerminateProcess" | "IsBadWritePtr" | "IsBadReadPtr" | "GetCPInfo" | "SetStdHandle"
-        | "IsValidLocale" | "IsDBCSLeadByteEx" => 8,
-        "GetEnvironmentVariableA" => 12,
+        "TerminateProcess"
+        | "IsBadWritePtr"
+        | "IsBadReadPtr"
+        | "GetCPInfo"
+        | "SetStdHandle"
+        | "IsValidLocale"
+        | "IsDBCSLeadByteEx"
+        | "lstrcmpiA"
+        | "GetSystemDirectoryA"
+        | "FindFirstFileW"
+        | "FindNextFileW" => 8,
+        "GetEnvironmentVariableA" | "FlushInstructionCache" => 12,
         "GetLocaleInfoA" | "GetLocaleInfoW" | "RtlUnwind" | "RaiseException" | "SetFilePointer"
         | "GetStringTypeW" => 16,
         "ReadFile" | "WriteFile" | "GetStringTypeA" => 20,

@@ -151,6 +151,17 @@ pub struct FilterInitialization {
     pub notes: Vec<String>,
 }
 
+/// Snapshot of a PE module after one initialization stage.  This is narrower
+/// than [`FilterInitialization`]: no extraction-filter callback is required.
+/// It exists so native recognizers can inspect self-decoded/self-modified code
+/// without treating the original x86 callback as the production decryptor.
+#[derive(Clone, Debug)]
+pub(crate) struct X86ModuleInitializationSnapshot {
+    pub stage: &'static str,
+    pub initialized_file: Vec<u8>,
+    pub changed_executable_bytes: usize,
+}
+
 impl Default for FilterProbeOptions {
     fn default() -> Self {
         Self {
@@ -2440,6 +2451,102 @@ fn detect_filter_info_size(uc: &Unicorn<'static, EmuState>, callback_va: u32) ->
     None
 }
 
+fn snapshot_initialized_module(
+    uc: &Unicorn<'static, EmuState>,
+    pe: &Pe32,
+    stage: &'static str,
+) -> Result<X86ModuleInitializationSnapshot> {
+    let original_image = pe.virtual_image()?;
+    let mut initialized_image = vec![0u8; pe.size_of_image as usize];
+    uc.mem_read(pe.image_base as u64, &mut initialized_image)
+        .map_err(uc_error)?;
+
+    let changed_executable_bytes = pe
+        .sections
+        .iter()
+        .filter(|section| section.executable())
+        .map(|section| {
+            let start = section.virtual_address as usize;
+            let len = section.raw_size as usize;
+            let end = start
+                .saturating_add(len)
+                .min(original_image.len())
+                .min(initialized_image.len());
+            if start >= end {
+                return 0;
+            }
+            original_image[start..end]
+                .iter()
+                .zip(&initialized_image[start..end])
+                .filter(|(before, after)| before != after)
+                .count()
+        })
+        .sum();
+
+    Ok(X86ModuleInitializationSnapshot {
+        stage,
+        initialized_file: pe.materialize_file_from_virtual(&initialized_image),
+        changed_executable_bytes,
+    })
+}
+
+/// Execute only the bounded initialization path needed to expose code that a
+/// plugin decodes or materializes at runtime.  Callers must already have
+/// structural evidence that the module is relevant; this function does not
+/// classify arbitrary DLLs as CXDEC.
+///
+/// Two snapshots can be returned.  The first is always immediately after
+/// `DLL_PROCESS_ATTACH`.  When the module exports `V2Link`, a second snapshot
+/// is taken after attempting V2Link with the existing minimal KiriKiri host.
+/// V2Link callback capture is deliberately *not* required here: the purpose is
+/// to recover native semantics from the initialized image, and later archive
+/// validation remains authoritative.
+fn initialize_x86_pe_for_static_analysis(
+    pe: Pe32,
+) -> Result<Vec<X86ModuleInitializationSnapshot>> {
+    if pe.export_rva("V2Link").is_none() {
+        return Err(Error::format(
+            "runtime static-analysis initialization requires an exported V2Link",
+        ));
+    }
+    let mut uc = build_emulator(&pe, false)?;
+    run_dll_process_attach(&mut uc, &pe)?;
+
+    let mut snapshots = vec![snapshot_initialized_module(
+        &uc,
+        &pe,
+        "dll-process-attach",
+    )?];
+
+    if let Some(v2_rva) = pe.export_rva("V2Link") {
+        let v2link_va = pe.image_base.wrapping_add(v2_rva);
+        match run_initialized_v2link_capture(&mut uc, &pe, v2link_va) {
+            Ok(callback) => uc.get_data_mut().initialization_notes.push(format!(
+                "V2Link registered XP3 extraction callback 0x{callback:08x}"
+            )),
+            Err(error) => uc.get_data_mut().initialization_notes.push(format!(
+                "V2Link side-effect probe stopped before proven callback registration: {error}"
+            )),
+        }
+        snapshots.push(snapshot_initialized_module(&uc, &pe, "v2link")?);
+    }
+
+    Ok(snapshots)
+}
+
+pub(crate) fn initialize_x86_module_for_static_analysis(
+    path: impl AsRef<Path>,
+) -> Result<Vec<X86ModuleInitializationSnapshot>> {
+    initialize_x86_pe_for_static_analysis(Pe32::from_path(path.as_ref())?)
+}
+
+pub(crate) fn initialize_x86_module_bytes_for_static_analysis(
+    raw_bytes: &[u8],
+) -> Result<Vec<X86ModuleInitializationSnapshot>> {
+    let normalized = crate::pe_normalize::normalize_pe_bytes(raw_bytes)?;
+    initialize_x86_pe_for_static_analysis(Pe32::parse(normalized.bytes)?)
+}
+
 pub fn initialize_x86_filter_module(
     path: impl AsRef<Path>,
     trace_code: bool,
@@ -3736,10 +3843,41 @@ fn emulate_win32_compat_api(uc: &mut Unicorn<'_, EmuState>, name: &str, esp: u64
         "FreeEnvironmentStringsA"
         | "FreeEnvironmentStringsW"
         | "FlushFileBuffers"
+        | "FlushInstructionCache"
         | "SetEndOfFile"
         | "SetStdHandle"
         | "SetHandleCount" => set_eax(uc, 1),
         "GetEnvironmentVariableA" => set_eax(uc, 0),
+        "GetSystemDirectoryA" => {
+            let output = arg(uc, 0) as u64;
+            let capacity = arg(uc, 1) as usize;
+            let path = b"C:\\Windows\\System32\0";
+            if output != 0 && capacity >= path.len() && uc.mem_write(output, path).is_ok() {
+                set_eax(uc, (path.len() - 1) as u64);
+            } else {
+                set_eax(uc, path.len() as u64);
+            }
+        }
+        "lstrcmpiA" => {
+            let left = read_c_string_uc(uc, arg(uc, 0) as u64, 4096).unwrap_or_default();
+            let right = read_c_string_uc(uc, arg(uc, 1) as u64, 4096).unwrap_or_default();
+            let ordering = left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase());
+            let value = match ordering {
+                std::cmp::Ordering::Less => -1i32,
+                std::cmp::Ordering::Equal => 0,
+                std::cmp::Ordering::Greater => 1,
+            };
+            set_eax(uc, value as u32 as u64);
+        }
+        "FindFirstFileW" => {
+            uc.get_data_mut().win32.set_last_error(2);
+            set_eax(uc, 0xffff_ffff);
+        }
+        "FindNextFileW" => {
+            uc.get_data_mut().win32.set_last_error(18);
+            set_eax(uc, 0);
+        }
+        "FindClose" => set_eax(uc, 1),
         "GetStdHandle" => set_eax(uc, 0xffff_ffff),
         "GetFileType" => set_eax(uc, 1),
         "SetUnhandledExceptionFilter" => set_eax(uc, 0),
