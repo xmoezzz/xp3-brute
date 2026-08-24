@@ -4,7 +4,7 @@ version = "0.3.7"
 edition = "2021"
 description = "Offline XP3 parser and brute-force recovery library/CLI"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.92"
 
 [lib]
 name = "xp3_brute"
