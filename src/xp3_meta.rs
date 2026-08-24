@@ -77,6 +77,8 @@ pub struct ArchiveMeta {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UnpackMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tjs: Option<String>,
     pub tlg: String,
     pub psb: String,
     pub pbd: String,
@@ -824,6 +826,7 @@ mod tests {
                 entry_count: 0,
             },
             unpack: UnpackMeta {
+                tjs: None,
                 tlg: "none".to_string(),
                 psb: "none".to_string(),
                 pbd: "none".to_string(),

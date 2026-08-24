@@ -29,6 +29,9 @@ enum SymValue {
     Real(f64),
     Str(String),
     Octet(Vec<u8>),
+    Array(Vec<SymValue>),
+    Dictionary(Vec<(SymValue, SymValue)>),
+    RegExp(String),
     Path(String),
     Function(usize),
     Symbolic(String),
@@ -50,7 +53,11 @@ impl SymValue {
             Self::Real(v) => Some(*v != 0.0 && !v.is_nan()),
             Self::Str(v) => Some(!v.is_empty()),
             Self::Octet(v) => Some(!v.is_empty()),
-            Self::Path(_) | Self::Function(_) => Some(true),
+            Self::Array(_)
+            | Self::Dictionary(_)
+            | Self::RegExp(_)
+            | Self::Path(_)
+            | Self::Function(_) => Some(true),
             Self::Unknown | Self::Symbolic(_) => None,
         }
     }
@@ -65,6 +72,23 @@ impl SymValue {
             Self::Real(v) => v.to_string(),
             Self::Str(v) => format!("{:?}", v),
             Self::Octet(v) => format!("octet[{}]", v.len()),
+            Self::Array(values) => format!(
+                "[{}]",
+                values
+                    .iter()
+                    .map(SymValue::display)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Self::Dictionary(entries) => format!(
+                "%[{}]",
+                entries
+                    .iter()
+                    .map(|(key, value)| format!("{}=>{}", key.display(), value.display()))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+            Self::RegExp(token) => token.clone(),
             Self::Path(v) => v.clone(),
             Self::Function(index) => format!("function#{index}"),
             Self::Symbolic(v) => v.clone(),
@@ -101,6 +125,7 @@ struct ExecState {
     predecessor: Option<usize>,
     vars: HashMap<VarId, SymValue>,
     memory: HashMap<String, SymValue>,
+    call_args: Vec<SymValue>,
     visits: HashMap<usize, usize>,
     steps: usize,
     return_value: SymValue,
@@ -113,6 +138,7 @@ impl ExecState {
             predecessor: None,
             vars: HashMap::new(),
             memory: HashMap::new(),
+            call_args: Vec::new(),
             visits: HashMap::new(),
             steps: 0,
             return_value: SymValue::Void,
@@ -227,6 +253,7 @@ impl<'a> Executor<'a> {
 
         let mut initial = ExecState::new(program.entry_block);
         initial.memory = inherited_memory.clone();
+        initial.call_args = args.to_vec();
         // TJS2 VM calling convention: %-1=this, %-2=this-proxy, arguments
         // begin at %-3 and continue downward.
         initial.vars.insert(
@@ -335,7 +362,28 @@ impl<'a> Executor<'a> {
                         queue.push_back(other);
                     }
                 },
-                Terminator::Ret | Terminator::Throw(_) => terminal.push(state),
+                Terminator::Ret(expr) => {
+                    state.return_value = self.eval_expr(
+                        &object,
+                        block.id,
+                        block.start_pc,
+                        expr,
+                        &mut state,
+                        depth,
+                    )?;
+                    terminal.push(state);
+                }
+                Terminator::Throw(expr) => {
+                    let _ = self.eval_expr(
+                        &object,
+                        block.id,
+                        block.start_pc,
+                        expr,
+                        &mut state,
+                        depth,
+                    )?;
+                    terminal.push(state);
+                }
                 Terminator::Exit => {
                     // tjs2dec currently maps VM_EXTRY to Terminator::Exit even
                     // though its CFG keeps the VM's normal fallthrough edge.
@@ -407,6 +455,12 @@ impl<'a> Executor<'a> {
                     state.memory.insert(path, value);
                 }
             }
+            Stmt::MemberDecl { name, value } => {
+                // tjs2dec 0.5 lowers class-body SPDS into an explicit member
+                // declaration.  In the VM this writes through objthis (`this`).
+                let value = self.eval_expr(object, block_id, pc, value, state, depth)?;
+                state.memory.insert(format!("this.{name}"), value);
+            }
             Stmt::Update {
                 dst,
                 target,
@@ -416,6 +470,21 @@ impl<'a> Executor<'a> {
                 let left = self.eval_expr(object, block_id, pc, target, state, depth)?;
                 let right = self.eval_expr(object, block_id, pc, rhs, state, depth)?;
                 let value = eval_binary(*op, left, right);
+                if let Some(path) = self.lvalue_path(object, block_id, pc, target, state, depth)? {
+                    state.memory.insert(path, value.clone());
+                }
+                if let Some(dst) = dst {
+                    state.vars.insert(*dst, value);
+                }
+            }
+            Stmt::IncDec {
+                dst,
+                target,
+                increment,
+            } => {
+                let old = self.eval_expr(object, block_id, pc, target, state, depth)?;
+                let op = if *increment { BinOp::Add } else { BinOp::Sub };
+                let value = eval_binary(op, old, SymValue::Int(1));
                 if let Some(path) = self.lvalue_path(object, block_id, pc, target, state, depth)? {
                     state.memory.insert(path, value.clone());
                 }
@@ -490,6 +559,13 @@ impl<'a> Executor<'a> {
             Expr::Real(v) => SymValue::Real(*v),
             Expr::Str(v) => SymValue::Str(v.clone()),
             Expr::Octet(v) => SymValue::Octet(v.clone()),
+            Expr::ObjectRef(index) | Expr::GeneratorRef(index) if *index >= 0 => {
+                SymValue::Function(*index as usize)
+            }
+            Expr::ObjectRef(_) | Expr::GeneratorRef(_) => SymValue::Unknown,
+            Expr::ScopeProxy => SymValue::Path(
+                if self.scope_is_class(object) { "this" } else { "global" }.into(),
+            ),
             Expr::Unary(op, inner) => {
                 let value = self.eval_expr(object, block_id, pc, inner, state, depth)?;
                 eval_unary(*op, value)
@@ -500,6 +576,72 @@ impl<'a> Executor<'a> {
                 let right = self.eval_expr(object, block_id, pc, right, state, depth)?;
                 eval_binary(*op, left, right)
             }
+            Expr::Conditional {
+                cond,
+                then_expr,
+                else_expr,
+            } => {
+                let cond = self.eval_expr(object, block_id, pc, cond, state, depth)?;
+                match cond.truthy() {
+                    Some(true) => {
+                        self.eval_expr(object, block_id, pc, then_expr, state, depth)?
+                    }
+                    Some(false) => {
+                        self.eval_expr(object, block_id, pc, else_expr, state, depth)?
+                    }
+                    None => {
+                        // Conditional expressions can contain calls/property
+                        // reads. Evaluate each possible branch in an isolated
+                        // state, retain sinks from both, then keep only state
+                        // facts that agree across both outcomes.
+                        let mut then_state = state.clone();
+                        let then_value = self.eval_expr(
+                            object,
+                            block_id,
+                            pc,
+                            then_expr,
+                            &mut then_state,
+                            depth,
+                        )?;
+                        let mut else_state = state.clone();
+                        let else_value = self.eval_expr(
+                            object,
+                            block_id,
+                            pc,
+                            else_expr,
+                            &mut else_state,
+                            depth,
+                        )?;
+                        state.vars = merge_vars([&then_state.vars, &else_state.vars]);
+                        state.memory = merge_memories([&then_state.memory, &else_state.memory]);
+                        merge_values([&then_value, &else_value])
+                    }
+                }
+            }
+            Expr::ArrayLiteral(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for item in items {
+                    values.push(self.eval_expr(object, block_id, pc, item, state, depth)?);
+                }
+                SymValue::Array(values)
+            }
+            Expr::DictionaryLiteral(items) => {
+                let mut values = Vec::with_capacity(items.len());
+                for (key, value) in items {
+                    let key = self.eval_expr(object, block_id, pc, key, state, depth)?;
+                    let value = self.eval_expr(object, block_id, pc, value, state, depth)?;
+                    values.push((key, value));
+                }
+                SymValue::Dictionary(values)
+            }
+            Expr::RegExpLiteral(token) => SymValue::RegExp(token.clone()),
+            // These nodes are meaningful primarily inside call argument lists.
+            // Keep direct evaluation conservative; eval_args below performs the
+            // actual expansion semantics.
+            Expr::ArgExpand(inner) => {
+                self.eval_expr(object, block_id, pc, inner, state, depth)?
+            }
+            Expr::ArgUnnamedExpand | Expr::ArgForwardAll => SymValue::Unknown,
             Expr::Member(base, member) => {
                 let base = self.eval_expr(object, block_id, pc, base, state, depth)?;
                 self.read_member(base, member, state)
@@ -541,7 +683,11 @@ impl<'a> Executor<'a> {
                     SymValue::Symbolic(format!(
                         "{}({})",
                         name,
-                        values.iter().map(SymValue::display).collect::<Vec<_>>().join(",")
+                        values
+                            .iter()
+                            .map(SymValue::display)
+                            .collect::<Vec<_>>()
+                            .join(",")
                     ))
                 }
             }
@@ -557,9 +703,35 @@ impl<'a> Executor<'a> {
         state: &mut ExecState,
         depth: usize,
     ) -> Result<Vec<SymValue>> {
-        args.iter()
-            .map(|arg| self.eval_expr(object, block_id, pc, arg, state, depth))
-            .collect()
+        let mut out = Vec::new();
+        for arg in args {
+            match arg {
+                Expr::ArgExpand(inner) => {
+                    match self.eval_expr(object, block_id, pc, inner, state, depth)? {
+                        SymValue::Array(values) => out.extend(values),
+                        // The exact cardinality of an unknown expanded value is
+                        // unavailable. Preserve one unknown slot so a following
+                        // sink does not incorrectly appear argument-less.
+                        _ => out.push(SymValue::Unknown),
+                    }
+                }
+                Expr::ArgUnnamedExpand => {
+                    // tjs2dec preserves FuncDeclUnnamedArgArrayBase from the
+                    // TJS2 object header. It is the first incoming argument
+                    // belonging to the unnamed/rest portion of this function.
+                    if let Ok(start) = usize::try_from(object.func_decl_unnamed_arg_array_base) {
+                        out.extend(state.call_args.iter().skip(start).cloned());
+                    } else {
+                        out.push(SymValue::Unknown);
+                    }
+                }
+                Expr::ArgForwardAll => {
+                    out.extend(state.call_args.iter().cloned());
+                }
+                _ => out.push(self.eval_expr(object, block_id, pc, arg, state, depth)?),
+            }
+        }
+        Ok(out)
     }
 
     fn read_member(&self, base: SymValue, member: &str, state: &ExecState) -> SymValue {
@@ -568,6 +740,9 @@ impl<'a> Executor<'a> {
                 return SymValue::Int(value.encode_utf16().count() as i64);
             }
             if let SymValue::Octet(value) = &base {
+                return SymValue::Int(value.len() as i64);
+            }
+            if let SymValue::Array(value) = &base {
                 return SymValue::Int(value.len() as i64);
             }
         }
@@ -597,6 +772,14 @@ impl<'a> Executor<'a> {
                 .nth(index as usize)
                 .and_then(|unit| char::from_u32(unit as u32))
                 .map(|ch| SymValue::Str(ch.to_string()))
+                .unwrap_or(SymValue::Void),
+            (SymValue::Array(values), SymValue::Int(index)) if index >= 0 => values
+                .get(index as usize)
+                .cloned()
+                .unwrap_or(SymValue::Void),
+            (SymValue::Dictionary(entries), key) => entries
+                .into_iter()
+                .find_map(|(entry_key, value)| (entry_key == key).then_some(value))
                 .unwrap_or(SymValue::Void),
             _ => SymValue::Unknown,
         }
@@ -793,7 +976,25 @@ fn merge_values<'a>(values: impl IntoIterator<Item = &'a SymValue>) -> SymValue 
     }
 }
 
-fn merge_memories<'a>(memories: impl IntoIterator<Item = &'a HashMap<String, SymValue>>) -> HashMap<String, SymValue> {
+fn merge_vars<'a>(
+    vars: impl IntoIterator<Item = &'a HashMap<VarId, SymValue>>,
+) -> HashMap<VarId, SymValue> {
+    let vars = vars.into_iter().collect::<Vec<_>>();
+    let Some(first) = vars.first() else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for (key, value) in first.iter() {
+        if vars.iter().skip(1).all(|other| other.get(key) == Some(value)) {
+            out.insert(*key, value.clone());
+        }
+    }
+    out
+}
+
+fn merge_memories<'a>(
+    memories: impl IntoIterator<Item = &'a HashMap<String, SymValue>>,
+) -> HashMap<String, SymValue> {
     let memories = memories.into_iter().collect::<Vec<_>>();
     let Some(first) = memories.first() else {
         return HashMap::new();
@@ -858,9 +1059,10 @@ fn eval_opaque_vm_op(op: &str, args: &[SymValue]) -> Option<SymValue> {
         // augments class-instance metadata without replacing the object.
         "CHGTHIS" | "ADDCI" => first(),
         "STR" | "STRING" => value_to_string(&first()),
-        "INT" | "NUM" => value_to_int(&first())
+        "INT" => value_to_int(&first())
             .map(SymValue::Int)
             .unwrap_or(SymValue::Unknown),
+        "NUM" => value_to_number(&first()),
         "REAL" => match first() {
             SymValue::Real(value) => SymValue::Real(value),
             SymValue::Int(value) => SymValue::Real(value as f64),
@@ -897,26 +1099,99 @@ fn eval_unary(op: UnOp, value: SymValue) -> SymValue {
             SymValue::Real(v) => SymValue::Real(-v),
             _ => SymValue::Unknown,
         },
-        UnOp::Not => value.truthy().map(|value| SymValue::Bool(!value)).unwrap_or(SymValue::Unknown),
+        UnOp::Not => value
+            .truthy()
+            .map(|value| SymValue::Bool(!value))
+            .unwrap_or(SymValue::Unknown),
         UnOp::BitNot => value_to_int(&value)
             .map(|value| SymValue::Int(!value))
             .unwrap_or(SymValue::Unknown),
-        // TJS2 typeof is not JavaScript typeof.  The VM returns the exact
-        // TJS type names with this casing: void, Object, String, Integer,
-        // Real, Octet.  Startup scripts commonly guard optional native
-        // methods with this result, so JS-style lowercase names make the
-        // executor take the wrong branch before the native call.
-        UnOp::Typeof => SymValue::Str(match value {
-            SymValue::Void => "void",
-            SymValue::Null | SymValue::Path(_) | SymValue::Function(_) => "Object",
-            SymValue::Bool(_) | SymValue::Int(_) => "Integer",
-            SymValue::Real(_) => "Real",
-            SymValue::Str(_) => "String",
-            SymValue::Octet(_) => "Octet",
-            SymValue::Unknown | SymValue::Symbolic(_) => return SymValue::Unknown,
+        UnOp::Num => value_to_number(&value),
+        UnOp::CharCode => match value_to_string(&value) {
+            SymValue::Str(value) => SymValue::Int(
+                value.encode_utf16().next().map(i64::from).unwrap_or(0),
+            ),
+            _ => SymValue::Unknown,
+        },
+        UnOp::CharFromCode => {
+            let Some(value) = value_to_int(&value) else {
+                return SymValue::Unknown;
+            };
+            let unit = value as u16;
+            // TJS strings can contain an isolated UTF-16 surrogate; Rust String
+            // cannot, so do not silently normalize it to U+FFFD.
+            if (0xd800..=0xdfff).contains(&unit) {
+                SymValue::Unknown
+            } else {
+                char::from_u32(unit as u32)
+                    .map(|ch| SymValue::Str(ch.to_string()))
+                    .unwrap_or(SymValue::Unknown)
+            }
         }
-        .into()),
+        // TJS2 typeof is not JavaScript typeof.  The VM returns these exact
+        // type names/casing.
+        UnOp::Typeof => SymValue::Str(
+            match value {
+                SymValue::Void => "void",
+                SymValue::Null
+                | SymValue::Array(_)
+                | SymValue::Dictionary(_)
+                | SymValue::RegExp(_)
+                | SymValue::Path(_)
+                | SymValue::Function(_) => "Object",
+                SymValue::Bool(_) | SymValue::Int(_) => "Integer",
+                SymValue::Real(_) => "Real",
+                SymValue::Str(_) => "String",
+                SymValue::Octet(_) => "Octet",
+                SymValue::Unknown | SymValue::Symbolic(_) => return SymValue::Unknown,
+            }
+            .into(),
+        ),
         UnOp::Delete => SymValue::Unknown,
+        UnOp::Int => value_to_int(&value)
+            .map(SymValue::Int)
+            .unwrap_or(SymValue::Unknown),
+        UnOp::Real => value_to_real(&value),
+        UnOp::String => value_to_string(&value),
+        UnOp::Octet => match value {
+            SymValue::Octet(bytes) => SymValue::Octet(bytes),
+            _ => SymValue::Unknown,
+        },
+        UnOp::Invalidate => match value {
+            SymValue::Void
+            | SymValue::Null
+            | SymValue::Bool(_)
+            | SymValue::Int(_)
+            | SymValue::Real(_)
+            | SymValue::Str(_)
+            | SymValue::Octet(_) => SymValue::Bool(false),
+            SymValue::Array(_)
+            | SymValue::Dictionary(_)
+            | SymValue::RegExp(_)
+            | SymValue::Path(_)
+            | SymValue::Function(_)
+            | SymValue::Unknown
+            | SymValue::Symbolic(_) => SymValue::Unknown,
+        },
+        UnOp::IsValid => match value {
+            SymValue::Void
+            | SymValue::Null
+            | SymValue::Bool(_)
+            | SymValue::Int(_)
+            | SymValue::Real(_)
+            | SymValue::Str(_)
+            | SymValue::Octet(_) => SymValue::Bool(true),
+            SymValue::Array(_)
+            | SymValue::Dictionary(_)
+            | SymValue::RegExp(_)
+            | SymValue::Path(_)
+            | SymValue::Function(_)
+            | SymValue::Unknown
+            | SymValue::Symbolic(_) => SymValue::Unknown,
+        },
+        // IgnoreProp changes getter/setter dispatch, not the materialized value.
+        // This executor does not model the dispatch distinction separately.
+        UnOp::IgnoreProp => value,
     }
 }
 
@@ -942,6 +1217,7 @@ fn eval_binary(op: BinOp, left: SymValue, right: SymValue) -> SymValue {
         BinOp::Sub
         | BinOp::Mul
         | BinOp::Div
+        | BinOp::IDiv
         | BinOp::Mod
         | BinOp::Shl
         | BinOp::Shr
@@ -949,8 +1225,36 @@ fn eval_binary(op: BinOp, left: SymValue, right: SymValue) -> SymValue {
         | BinOp::BitAnd
         | BinOp::BitOr
         | BinOp::BitXor => numeric_binary(op, left, right),
-        BinOp::Eq | BinOp::StrictEq => SymValue::Bool(left == right),
-        BinOp::Ne | BinOp::StrictNe => SymValue::Bool(left != right),
+        BinOp::Eq | BinOp::StrictEq => {
+            if matches!(
+                (&left, &right),
+                (SymValue::Array(_), _)
+                    | (_, SymValue::Array(_))
+                    | (SymValue::Dictionary(_), _)
+                    | (_, SymValue::Dictionary(_))
+                    | (SymValue::RegExp(_), _)
+                    | (_, SymValue::RegExp(_))
+            ) {
+                SymValue::Unknown
+            } else {
+                SymValue::Bool(left == right)
+            }
+        }
+        BinOp::Ne | BinOp::StrictNe => {
+            if matches!(
+                (&left, &right),
+                (SymValue::Array(_), _)
+                    | (_, SymValue::Array(_))
+                    | (SymValue::Dictionary(_), _)
+                    | (_, SymValue::Dictionary(_))
+                    | (SymValue::RegExp(_), _)
+                    | (_, SymValue::RegExp(_))
+            ) {
+                SymValue::Unknown
+            } else {
+                SymValue::Bool(left != right)
+            }
+        }
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => compare_binary(op, left, right),
         BinOp::LogAnd => match left.truthy() {
             Some(false) => left,
@@ -967,6 +1271,7 @@ fn eval_binary(op: BinOp, left: SymValue, right: SymValue) -> SymValue {
         BinOp::SubAssign => eval_binary(BinOp::Sub, left, right),
         BinOp::MulAssign => eval_binary(BinOp::Mul, left, right),
         BinOp::DivAssign => eval_binary(BinOp::Div, left, right),
+        BinOp::IDivAssign => eval_binary(BinOp::IDiv, left, right),
         BinOp::ModAssign => eval_binary(BinOp::Mod, left, right),
         BinOp::ShlAssign => eval_binary(BinOp::Shl, left, right),
         BinOp::ShrAssign => eval_binary(BinOp::Shr, left, right),
@@ -974,7 +1279,12 @@ fn eval_binary(op: BinOp, left: SymValue, right: SymValue) -> SymValue {
         BinOp::AndAssign => eval_binary(BinOp::BitAnd, left, right),
         BinOp::OrAssign => eval_binary(BinOp::BitOr, left, right),
         BinOp::XorAssign => eval_binary(BinOp::BitXor, left, right),
-        BinOp::In => SymValue::Unknown,
+        BinOp::LogAndAssign => eval_binary(BinOp::LogAnd, left, right),
+        BinOp::LogOrAssign => eval_binary(BinOp::LogOr, left, right),
+        BinOp::In | BinOp::InstanceOf => SymValue::Unknown,
+        // `incontextof` changes the bound `this`; keep callable identity so
+        // bootstrap call chains remain followable.
+        BinOp::InContextOf => left,
     }
 }
 
@@ -987,6 +1297,10 @@ fn numeric_binary(op: BinOp, left: SymValue, right: SymValue) -> SymValue {
         BinOp::Sub => SymValue::Int(a.wrapping_sub(b)),
         BinOp::Mul => SymValue::Int(a.wrapping_mul(b)),
         BinOp::Div if b != 0 => a
+            .checked_div(b)
+            .map(SymValue::Int)
+            .unwrap_or(SymValue::Unknown),
+        BinOp::IDiv if b != 0 => a
             .checked_div(b)
             .map(SymValue::Int)
             .unwrap_or(SymValue::Unknown),
@@ -1024,6 +1338,39 @@ fn compare_binary(op: BinOp, left: SymValue, right: SymValue) -> SymValue {
         });
     }
     SymValue::Unknown
+}
+
+fn value_to_number(value: &SymValue) -> SymValue {
+    match value {
+        SymValue::Int(v) => SymValue::Int(*v),
+        SymValue::Real(v) => SymValue::Real(*v),
+        SymValue::Bool(v) => SymValue::Int(if *v { 1 } else { 0 }),
+        SymValue::Str(v) => {
+            let text = v.trim();
+            if let Ok(value) = text.parse::<i64>() {
+                SymValue::Int(value)
+            } else if let Ok(value) = text.parse::<f64>() {
+                SymValue::Real(value)
+            } else {
+                SymValue::Unknown
+            }
+        }
+        _ => SymValue::Unknown,
+    }
+}
+
+fn value_to_real(value: &SymValue) -> SymValue {
+    match value {
+        SymValue::Real(v) => SymValue::Real(*v),
+        SymValue::Int(v) => SymValue::Real(*v as f64),
+        SymValue::Bool(v) => SymValue::Real(if *v { 1.0 } else { 0.0 }),
+        SymValue::Str(v) => v
+            .trim()
+            .parse::<f64>()
+            .map(SymValue::Real)
+            .unwrap_or(SymValue::Unknown),
+        _ => SymValue::Unknown,
+    }
 }
 
 fn value_to_int(value: &SymValue) -> Option<i64> {
@@ -1202,6 +1549,25 @@ mod tests {
         assert_eq!(
             eval_unary(UnOp::Typeof, SymValue::Real(1.0)),
             SymValue::Str("Real".into())
+        );
+    }
+    #[test]
+    fn inline_collection_values_are_truthy_and_indexable() {
+        let array = SymValue::Array(vec![
+            SymValue::Str("first".into()),
+            SymValue::Int(2),
+        ]);
+        assert_eq!(array.truthy(), Some(true));
+        let state = ExecState::new(0);
+        let executor_file = Tjs2File {
+            toplevel: 0,
+            const_pools: Default::default(),
+            objects: Vec::new(),
+        };
+        let executor = Executor::new(&executor_file);
+        assert_eq!(
+            executor.read_index(array, SymValue::Int(0), &state),
+            SymValue::Str("first".into())
         );
     }
 }

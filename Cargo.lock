@@ -2105,9 +2105,9 @@ dependencies = [
 
 [[package]]
 name = "tjs2dec"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ca509921484296b2a003d13a332bae26dbbe7e67fac0d1a69cf7fb201926062c"
+checksum = "52c04e107eb18c9ae4dbf1a93b9957ff46e7ae9ee48b315fc17b0ebba066c97a"
 dependencies = [
  "anyhow",
  "clap",

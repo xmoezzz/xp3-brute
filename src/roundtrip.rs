@@ -1241,6 +1241,7 @@ mod tests {
                 entry_count: 1,
             },
             unpack: UnpackMeta {
+                tjs: None,
                 tlg: if format.starts_with("TLG") {
                     "png".to_string()
                 } else {
@@ -1416,6 +1417,7 @@ mod tests {
                 entry_count: 1,
             },
             unpack: UnpackMeta {
+                tjs: None,
                 tlg: "png".to_string(),
                 psb: "none".to_string(),
                 pbd: "none".to_string(),

@@ -1185,7 +1185,7 @@ fn direct_call_exec_argument(code: &[u8], call_index: usize, pe: &Pe32) -> Optio
 /// wrapper's first argument into a call through that slot proves the wrapper's
 /// semantics without executing it.
 fn find_registration_wrapper_forwarding_first_arg(
-    pe: &Pe32,
+    _pe: &Pe32,
     xref_va: u32,
     xref_index: usize,
     section_code: &[u8],

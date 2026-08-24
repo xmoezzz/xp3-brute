@@ -2428,7 +2428,6 @@ fn find_prolog_branch_dispatches(
                         first_je = Some((cursor, target));
                     } else {
                         second_je = Some((cursor, target));
-                        cursor += len;
                         break;
                     }
                     cursor += len;

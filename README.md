@@ -30,6 +30,8 @@ The executable is:
 target/release/xp3brute
 ```
 
+Tagged releases also publish prebuilt Linux x86_64, macOS arm64, and Windows x86_64 binaries. See [`docs/CI.md`](docs/CI.md) for the CI and release policy, including the Linux glibc compatibility baseline.
+
 A CPU-only build without the optional GPU backend is also available:
 
 ```bash
@@ -92,6 +94,7 @@ xp3brute unpack data.xp3 out --unpacker-all
 
 | Resource | Default | With `--unpacker-all` |
 |---|---|---|
+| Compiled TJS2 (`.tjs`) | keep bytecode | high-level decompile, same `.tjs` path |
 | TLG5/TLG6 | keep TLG | convert to PNG |
 | PSB / SCN / MTN / PIMG | keep original | JSON + decoded PNG/resources |
 | PBD | keep original | typed JSON |
@@ -101,6 +104,8 @@ xp3brute unpack data.xp3 out --unpacker-all
 Individual decoders can be selected explicitly:
 
 ```bash
+xp3brute unpack data.xp3 out --tjs decompile
+xp3brute unpack data.xp3 out --tjs emit
 xp3brute unpack data.xp3 out --tlg png
 xp3brute unpack data.xp3 out --psb json
 xp3brute unpack data.xp3 out --psb png
@@ -108,7 +113,7 @@ xp3brute unpack data.xp3 out --pbd json
 xp3brute unpack data.xp3 out --amv png
 ```
 
-Explicit options override the `--unpacker-all` preset.
+Explicit options override the `--unpacker-all` preset. TJS2 conversion never changes the filename: `scenario.tjs` remains `scenario.tjs`. If loading/emission/decompilation fails, the original TJS2 bytes are preserved. Repacking treats an extracted text `.tjs` as source text and writes it back directly; `xp3brute` does not attempt to compile it back into TJS2 bytecode.
 
 ---
 

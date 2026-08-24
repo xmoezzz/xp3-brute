@@ -1,6 +1,8 @@
 use encoding_rs::SHIFT_JIS;
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
+use tjs2dec::decompile::srcgen_high::dump_src_file as dump_tjs_source_high;
+use tjs2dec::{emit_executable_tjs, load_tjs2_bytecode};
 use std::env;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
@@ -519,8 +521,46 @@ impl UnpackAmvMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnpackTjsMode {
+    None,
+    Emit,
+    Decompile,
+}
+
+impl Default for UnpackTjsMode {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+impl UnpackTjsMode {
+    /// High-level source is the most useful editable representation for the
+    /// aggregate converter preset.  `emit` remains available explicitly when
+    /// the lower-level executable TJS produced by tjs2dec is preferred.
+    const DEFAULT_UNPACK: Self = Self::Decompile;
+
+    fn parse(value: &str) -> Result<Self, io::Error> {
+        match value.to_ascii_lowercase().as_str() {
+            "none" | "off" => Ok(Self::None),
+            "emit" => Ok(Self::Emit),
+            "decompile" | "decompiled" => Ok(Self::Decompile),
+            _ => Err(cli_error("--tjs must be emit|decompile|none")),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Emit => "emit",
+            Self::Decompile => "decompile",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct UnpackDecodeOptions {
+    tjs: UnpackTjsMode,
     tlg: UnpackImageMode,
     psb: UnpackPsbMode,
     pbd: UnpackPbdMode,
@@ -532,6 +572,7 @@ impl UnpackDecodeOptions {
     /// user-facing output. Normal `unpack` still defaults to no conversion.
     const fn all_decoder_defaults() -> Self {
         Self {
+            tjs: UnpackTjsMode::DEFAULT_UNPACK,
             tlg: UnpackImageMode::DEFAULT_UNPACK,
             psb: UnpackPsbMode::DEFAULT_UNPACK,
             pbd: UnpackPbdMode::DEFAULT_UNPACK,
@@ -1663,6 +1704,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut decode_options = UnpackDecodeOptions::default();
             let mut unpacker_all = false;
             let mut x86_filter_target: Option<PathBuf> = None;
+            let mut explicit_tjs = false;
             let mut explicit_tlg = false;
             let mut explicit_psb = false;
             let mut explicit_pbd = false;
@@ -1722,6 +1764,14 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                                 .ok_or_else(|| cli_error("missing --filter-exe value"))?,
                         ));
                     }
+                    "--tjs" => {
+                        i += 1;
+                        let value = rest
+                            .get(i)
+                            .ok_or_else(|| cli_error("missing --tjs value"))?;
+                        decode_options.tjs = UnpackTjsMode::parse(value)?;
+                        explicit_tjs = true;
+                    }
                     "--tlg" => {
                         i += 1;
                         let value = rest
@@ -1764,6 +1814,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             if unpacker_all {
                 let defaults = UnpackDecodeOptions::all_decoder_defaults();
+                if !explicit_tjs {
+                    decode_options.tjs = defaults.tjs;
+                }
                 if !explicit_tlg {
                     decode_options.tlg = defaults.tlg;
                 }
@@ -6481,6 +6534,7 @@ fn build_xp3_meta(
             entry_count: archive.entries.len(),
         },
         unpack: UnpackMeta {
+            tjs: Some(decode_options.tjs.label().to_string()),
             tlg: decode_options.tlg.label().to_string(),
             psb: decode_options.psb.label().to_string(),
             pbd: decode_options.pbd.label().to_string(),
@@ -7866,8 +7920,8 @@ fn unpack(
     fs::create_dir_all(out_dir)?;
     let mut xp3_meta = build_xp3_meta(archive, out_dir, decode_options);
     eprintln!(
-        "[output        ] mode=clean root={} diagnostics=internal-only tjs2_decompile=internal-only tlg={} psb={} pbd={} global_psb_key_cache=on",
-        out_dir.display(), decode_options.tlg.label(), decode_options.psb.label(), decode_options.pbd.label(),
+        "[output        ] mode=clean root={} diagnostics=internal-only tjs={} tlg={} psb={} pbd={} global_psb_key_cache=on",
+        out_dir.display(), decode_options.tjs.label(), decode_options.tlg.label(), decode_options.psb.label(), decode_options.pbd.label(),
     );
     if let Some(module) = x86_filter_module {
         eprintln!(
@@ -9977,8 +10031,37 @@ fn tlg_container_meta(bytes: &[u8], container: &xp3_brute::TlgContainerInfo) -> 
 }
 
 /// Apply user-requested archive-output conversion without changing recovery.
+fn output_is_tjs(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("tjs"))
+}
+
+fn render_tjs2_user_source(bytes: &[u8], mode: UnpackTjsMode) -> Result<Vec<u8>, String> {
+    let file = load_tjs2_bytecode(bytes)
+        .map_err(|err| format!("tjs2dec bytecode load failed: {err}"))?;
+    let source = match mode {
+        UnpackTjsMode::Emit => emit_executable_tjs(&file)
+            .map_err(|err| format!("tjs2dec executable-TJS emission failed: {err}"))?,
+        UnpackTjsMode::Decompile => dump_tjs_source_high(&file)
+            .map_err(|err| format!("tjs2dec high-level decompile failed: {err}"))?,
+        UnpackTjsMode::None => {
+            return Err("TJS conversion requested with mode=none".to_string())
+        }
+    };
+
+    // KiriKiri source scripts are written as ordinary text, not recompiled
+    // TJS2 bytecode. UTF-16LE+BOM is already the canonical editable text
+    // representation used by this unpacker and is accepted by KiriKiri's text
+    // loader without depending on the host locale.
+    Ok(utf16le_with_bom(&source))
+}
+
 /// Every destructive/derived conversion returns a manifest record sufficient
 /// for a future repacker to reconnect the edited artifact to its source asset.
+/// TJS2 source conversion is intentionally *not* recorded as a reversible
+/// transform: the unpacked `.tjs` becomes authoritative source text and pack
+/// writes that text back directly rather than trying to compile it to bytecode.
 /// TLG is an image, so conversion replaces the raw TLG output. PSB is a
 /// model/container, so the PSB itself is retained while derived resource blobs
 /// are exported when requested.
@@ -9988,6 +10071,34 @@ fn write_unpack_asset_output(
     options: &UnpackDecodeOptions,
     meta_root: &Path,
 ) -> Result<AssetWriteResult, Box<dyn std::error::Error>> {
+    let rendered_tjs = if !matches!(options.tjs, UnpackTjsMode::None)
+        && output_is_tjs(output)
+        && bytes.starts_with(b"TJS2100\0")
+    {
+        match render_tjs2_user_source(bytes, options.tjs) {
+            Ok(source) => {
+                eprintln!(
+                    "[tjs           ] file={} mode={} output=same-path encoding=utf-16le",
+                    output.display(),
+                    options.tjs.label(),
+                );
+                Some(source)
+            }
+            Err(err) => {
+                eprintln!(
+                    "[tjs           ] file={} mode={} failed: {}; preserving original TJS2 bytecode",
+                    output.display(),
+                    options.tjs.label(),
+                    err,
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let bytes = rendered_tjs.as_deref().unwrap_or(bytes);
+
     if let Some(format) = options.tlg.tlg_format() {
         if is_tlg_bytes(bytes) {
             match decode_tlg(bytes) {
@@ -10630,12 +10741,13 @@ fn usage() {
                   [--exe game.exe] [--no-exe-auto] [--hx-key HEX64 --hx-nonce HEX48] [--hx-names HxNames.lst]\n\
                   [--name-dict FILE] [--hx-game-dir DIR] [--no-hx-name-bootstrap]\n\
                   [--filter-exe game.exe|module.dll|plugin.tpm|game-dir]\n\
-                  [--unpacker-all] [--tlg png|jpg|bmp|none] [--psb all|json|png|jpg|bmp|none]\n\
-                  [--pbd json|none] [--amv png|none]\n\
+                  [--unpacker-all] [--tjs emit|decompile|none] [--tlg png|jpg|bmp|none]\n\
+                  [--psb all|json|png|jpg|bmp|none] [--pbd json|none] [--amv png|none]\n\
                   [--no-progress] [--verbose]\n\
                   (normal unpack defaults to no derived conversion; --unpacker-all enables\n\
-                   TLG->PNG, PSB-family->JSON+PNG image blobs+raw unknown blobs, PBD->JSON, and AMV->PNG frames; explicit per-decoder\n\
-                   options override --unpacker-all regardless of command-line order)\n\
+                   TJS2->high-level source, TLG->PNG, PSB-family->JSON+PNG image blobs+raw unknown blobs,\n\
+                   PBD->JSON, and AMV->PNG frames; explicit per-decoder options override --unpacker-all\n\
+                   regardless of command-line order)\n\
            probe <archive> [--max-period N] [--top N] [--exhaustive-dynamic] [--compute auto|cpu|gpu|hybrid]\n\
            xor-recover <file> [--min-period N] [--max-period N] [--top N] --crib OFFSET:HEX ...\n\
          \n\
@@ -10673,12 +10785,14 @@ mod cli_routing_tests {
     #[test]
     fn unpack_image_conversion_defaults_to_none_and_accepts_expected_formats() {
         let defaults = UnpackDecodeOptions::default();
+        assert_eq!(defaults.tjs, UnpackTjsMode::None);
         assert_eq!(defaults.tlg, UnpackImageMode::None);
         assert_eq!(defaults.psb, UnpackPsbMode::None);
         assert_eq!(defaults.pbd, UnpackPbdMode::None);
         assert_eq!(defaults.amv, UnpackAmvMode::None);
 
         let all = UnpackDecodeOptions::all_decoder_defaults();
+        assert_eq!(all.tjs, UnpackTjsMode::Decompile);
         assert_eq!(all.tlg, UnpackImageMode::Png);
         assert_eq!(all.psb, UnpackPsbMode::All);
         assert_eq!(all.pbd, UnpackPbdMode::Json);
@@ -10704,6 +10818,12 @@ mod cli_routing_tests {
         assert_eq!(UnpackPbdMode::parse("json").unwrap(), UnpackPbdMode::Json);
         assert_eq!(UnpackPbdMode::parse("none").unwrap(), UnpackPbdMode::None);
         assert_eq!(UnpackAmvMode::parse("png").unwrap(), UnpackAmvMode::Png);
+        assert_eq!(UnpackTjsMode::parse("emit").unwrap(), UnpackTjsMode::Emit);
+        assert_eq!(
+            UnpackTjsMode::parse("decompile").unwrap(),
+            UnpackTjsMode::Decompile
+        );
+        assert!(UnpackTjsMode::parse("source").is_err());
         assert!(UnpackImageMode::parse("webp", "--tlg").is_err());
         assert_eq!(EmoteTextureExportFormat::Jpeg.extension(), "jpg");
     }
