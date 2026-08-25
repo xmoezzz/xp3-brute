@@ -8,6 +8,12 @@ xp3brute unpack data.xp3 out
 
 The tool will inspect the archive and write files to `out/`.
 
+`unpack` keeps the normal console view intentionally compact: it emits stable
+`status phase=...` progress records plus one final `summary`. The interactive
+terminal view renders those same states as a single progress bar. Use
+`--verbose` when you need per-probe recovery evidence; use `--no-progress` for
+an even quieter embedding-friendly invocation.
+
 Core Ideas:
 This time we do not rely on the runtime to extract the archive.
 - For complex CXDEC variants, the tool can recover the key parameters.
@@ -17,6 +23,29 @@ This time we do not rely on the runtime to extract the archive.
 ---
 
 ## Quick start
+
+### Workspace layout
+
+This repository is a Cargo workspace:
+
+```text
+xp3-brute/                 # shared core library and xp3brute CLI
+apps/xp3-desktop/          # native eframe/egui desktop app
+```
+
+The CLI remains the default workspace member, so existing `cargo build` and
+`cargo run -- ...` workflows are unchanged. Build the desktop application with:
+
+```bash
+cargo build -p xp3-brute --bin xp3brute
+cargo run -p xp3-brute-desktop --bin xp3brute-gui
+```
+
+The desktop app provides archive browsing, search, raw selected-entry export,
+file/folder pickers, and an asynchronous full-unpack view. Full unpack invokes
+the same `xp3brute unpack` pipeline and streams its normalized status output
+into the operation log. When the CLI is not on `PATH`, set `XP3BRUTE_BIN` to
+its absolute path.
 
 ### Build
 
@@ -37,6 +66,38 @@ A CPU-only build without the optional GPU backend is also available:
 ```bash
 cargo build --release --no-default-features --features magic-sniff
 ```
+
+### Python / CPython bindings
+
+The project ships a native CPython extension rather than a subprocess wrapper.
+It exposes archive inspection and reconstruction, PBD/TLG/AMV conversion,
+manifest rebuild/pack/round-trip verification, filter detection, and repeating
+XOR recovery. Build/install it with [maturin](https://www.maturin.rs/):
+
+```bash
+python -m pip install maturin
+maturin develop --release --features python
+```
+
+The extension targets Python's stable ABI (Python 3.9+). Structured reports
+are returned as JSON strings, ready for `json.loads` or direct logging.
+
+```python
+import json
+import xp3_brute
+
+archive = xp3_brute.Archive("data.xp3")
+print(json.loads(archive.summary_json()))
+for entry in archive.entries():
+    print(entry.index, entry.name, entry.original_size)
+
+storage_bytes = archive.reconstruct_entry(0)
+report = json.loads(xp3_brute.detect_filter_json("game.exe"))
+print(report["backend"], report["confidence"])
+```
+
+Rust consumers continue to use the same frontend-neutral public API directly;
+enabling the `python` Cargo feature only adds the extension module.
 
 ---
 

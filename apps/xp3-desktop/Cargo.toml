@@ -1,0 +1,16 @@
+[package]
+name = "xp3-brute-desktop"
+version = "0.3.7"
+edition = "2021"
+rust-version = "1.92"
+description = "Native desktop UI for xp3-brute"
+license = "MIT"
+
+[[bin]]
+name = "xp3brute-gui"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.31", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+rfd = "0.15"
+xp3-brute = { path = "../..", default-features = false }

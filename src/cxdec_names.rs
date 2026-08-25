@@ -1242,7 +1242,7 @@ mod tests {
 
     #[test]
     fn materialized_state_recovers_complete_fixed_params() {
-        let control = [
+        let control: [u32; 8] = [
             0x1020_3040,
             0x5060_7080,
             0x90a0_b0c0,
@@ -1252,8 +1252,8 @@ mod tests {
             0x99aa_bbcc,
             0xddee_ff00,
         ];
-        let seed0 = 0xbdd7_2518;
-        let seed1 = 0xd541_d24c;
+        let seed0: u32 = 0xbdd7_2518;
+        let seed1: u32 = 0xd541_d24c;
         let mut bytes = vec![0xa5; 31];
         for word in RIDDLE_YUZ_PREFIX {
             bytes.extend_from_slice(&word.to_le_bytes());
@@ -1266,7 +1266,7 @@ mod tests {
         bytes.extend_from_slice(&(!seed0).to_le_bytes());
         bytes.extend_from_slice(&(!seed1).to_le_bytes());
 
-        let candidates = recover_riddle_special_fixed_params_from_bytes(&bytes);
+        let candidates = recover_riddle_special_fixed_params_from_pe_bytes(&bytes);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].fixed, SpecialFixedParams::new(control, seed0, seed1));
         assert_eq!(candidates[0].representation, "stored-special-state");
@@ -1284,13 +1284,13 @@ mod tests {
         // The same 16-byte sigma constant appears in ordinary ChaCha code.
         // The two following DWORDs are not parameters unless x86 data flow
         // proves that they are passed as the seed arguments.
-        assert!(recover_riddle_special_fixed_params_from_bytes(&bytes).is_empty());
+        assert!(recover_riddle_special_fixed_params_from_pe_bytes(&bytes).is_empty());
         assert!(recover_riddle_special_seed_candidates_from_bytes(&bytes).is_empty());
     }
 
     #[test]
     fn working_yuz_state_uncomplements_control_words() {
-        let control = [
+        let control: [u32; 8] = [
             0x0102_0304,
             0x1112_1314,
             0x2122_2324,
@@ -1300,8 +1300,8 @@ mod tests {
             0x6162_6364,
             0x7172_7374,
         ];
-        let seed0 = 0x89ab_cdef;
-        let seed1 = 0x7654_3210;
+        let seed0: u32 = 0x89ab_cdef;
+        let seed1: u32 = 0x7654_3210;
         let mut bytes = Vec::new();
         for word in RIDDLE_YUZ_SIGMA {
             bytes.extend_from_slice(&word.to_le_bytes());
@@ -1314,7 +1314,7 @@ mod tests {
         bytes.extend_from_slice(&seed0.to_le_bytes());
         bytes.extend_from_slice(&seed1.to_le_bytes());
 
-        let candidates = recover_riddle_special_fixed_params_from_bytes(&bytes);
+        let candidates = recover_riddle_special_fixed_params_from_pe_bytes(&bytes);
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].fixed, SpecialFixedParams::new(control, seed0, seed1));
         assert_eq!(candidates[0].representation, "working-special-state");

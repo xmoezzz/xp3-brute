@@ -24,6 +24,8 @@ pub mod legacy_cxdec;
 pub mod magic_sniff;
 pub mod pe_normalize;
 pub mod progress;
+#[cfg(feature = "python")]
+mod python;
 pub mod repeating_xor;
 pub mod roundtrip;
 pub mod script_names;

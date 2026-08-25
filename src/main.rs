@@ -5,7 +5,7 @@ use tjs2dec::decompile::srcgen_high::dump_src_file as dump_tjs_source_high;
 use tjs2dec::{emit_executable_tjs, load_tjs2_bytecode};
 use std::env;
 use std::fs;
-use std::io::{self, ErrorKind, Write};
+use std::io::{self, ErrorKind, IsTerminal, Write};
 use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{
@@ -600,6 +600,7 @@ struct Progress {
     last_percent: AtomicUsize,
     started: Instant,
     enabled: bool,
+    interactive: bool,
 }
 impl Progress {
     fn new(label: &'static str, total: usize, enabled: bool) -> Self {
@@ -610,6 +611,7 @@ impl Progress {
             last_percent: AtomicUsize::new(usize::MAX),
             started: Instant::now(),
             enabled,
+            interactive: io::stderr().is_terminal(),
         }
     }
     fn tick(&self) {
@@ -619,7 +621,12 @@ impl Progress {
         }
         let pct = done.saturating_mul(100) / self.total;
         let old = self.last_percent.load(Ordering::Relaxed);
-        if pct != old
+        let should_render = if self.interactive {
+            pct != old
+        } else {
+            old == usize::MAX || pct / 10 != old / 10 || done == self.total
+        };
+        if should_render
             && self
                 .last_percent
                 .compare_exchange(old, pct, Ordering::Relaxed, Ordering::Relaxed)
@@ -633,17 +640,33 @@ impl Progress {
             } else {
                 0.0
             };
-            eprint!(
-                "\r[{:<14}] {:>3}% {}/{} {:>8.1} entries/s eta={}",
-                self.label,
-                pct,
-                done,
-                self.total,
-                rate,
-                format_duration(eta)
-            );
-            if done == self.total {
-                eprintln!();
+            if self.interactive {
+                let width = 20usize;
+                let filled = width.saturating_mul(pct) / 100;
+                let bar = format!("{}{}", "█".repeat(filled), "░".repeat(width - filled));
+                eprint!(
+                    "\r\x1b[2K\x1b[36m{:>12}\x1b[0m {} {:>3}% {}/{} {:>8.1}/s eta {}",
+                    self.label,
+                    bar,
+                    pct,
+                    done,
+                    self.total,
+                    rate,
+                    format_duration(eta)
+                );
+                if done == self.total {
+                    eprintln!();
+                }
+            } else {
+                eprintln!(
+                    "status phase={} progress={}% completed={}/{} rate={:.1}/s eta={}",
+                    self.label,
+                    pct,
+                    done,
+                    self.total,
+                    rate,
+                    format_duration(eta)
+                );
             }
         }
     }
@@ -7915,10 +7938,37 @@ fn unpack(
     progress_enabled: bool,
     verbose: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // `unpack` performs many probes.  The default view deliberately reports
+    // only lifecycle states, progress, and the final summary; `--verbose`
+    // restores the evidence needed for recovery troubleshooting.
+    macro_rules! eprintln {
+        ($($arg:tt)*) => {
+            if verbose {
+                ::std::eprintln!($($arg)*);
+            }
+        };
+    }
+
     reset_compute_telemetry();
     cleanup_legacy_unpack_artifacts(out_dir)?;
     fs::create_dir_all(out_dir)?;
     let mut xp3_meta = build_xp3_meta(archive, out_dir, decode_options);
+    {
+        let mut stdout = io::stdout().lock();
+        writeln!(
+            stdout,
+            "status phase=start entries={} archive={} output={} compute={}",
+            archive.entries.len(),
+            archive
+                .path
+                .as_deref()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "<memory>".to_string()),
+            out_dir.display(),
+            compute_mode,
+        )?;
+        stdout.flush()?;
+    }
     eprintln!(
         "[output        ] mode=clean root={} diagnostics=internal-only tjs={} tlg={} psb={} pbd={} global_psb_key_cache=on",
         out_dir.display(), decode_options.tjs.label(), decode_options.tlg.label(), decode_options.psb.label(), decode_options.pbd.label(),
