@@ -13,6 +13,7 @@ use crate::{
     Error, Result,
 };
 use flate2::read::ZlibDecoder;
+use flate2::{Decompress, FlushDecompress, Status};
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::Path;
@@ -454,6 +455,36 @@ impl CxdecNameProfile {
     /// payload. Family selection is supplied by the recovered profile, never
     /// by the XP3 root tag.
     pub fn decode_payload_bytes(self, stored: &[u8]) -> Result<Vec<u8>> {
+        decode_cxdec_name_zlib(&self.decrypt_payload(stored))
+    }
+
+    /// Decode a filename section whose descriptor declares its exact size.
+    /// Reject incomplete streams and bytes after the zlib trailer.
+    pub fn decode_payload_bytes_exact(self, stored: &[u8], expected_size: u64) -> Result<Vec<u8>> {
+        if expected_size > MAX_DECOMPRESSED_NAMES {
+            return Err(Error::format(
+                "CXDEC filename section exceeds the 64 MiB safety limit",
+            ));
+        }
+        let encoded = self.decrypt_payload(stored);
+        let mut decoded = vec![0; expected_size as usize + 1];
+        let mut decoder = Decompress::new(true);
+        let status = decoder
+            .decompress(&encoded, &mut decoded, FlushDecompress::Finish)
+            .map_err(|error| Error::format(format!("CXDEC filename zlib stream: {error}")))?;
+        if status != Status::StreamEnd
+            || decoder.total_in() != encoded.len() as u64
+            || decoder.total_out() != expected_size
+        {
+            return Err(Error::format(
+                "CXDEC filename stream or decoded size does not match its descriptor",
+            ));
+        }
+        decoded.truncate(expected_size as usize);
+        Ok(decoded)
+    }
+
+    fn decrypt_payload(self, stored: &[u8]) -> Vec<u8> {
         let mut encoded = stored.to_vec();
         let encrypted_len = encoded.len().min(ENCRYPTED_NAMES_PREFIX);
         match self {
@@ -464,7 +495,7 @@ impl CxdecNameProfile {
             }
         }
 
-        decode_cxdec_name_zlib(&encoded)
+        encoded
     }
 
     /// Decrypt, zlib-decompress, and parse a complete CXDEC filename metadata

@@ -124,6 +124,30 @@ xp3brute unpack data.xp3 out --exe game.exe
 
 `--exe` may point to the game executable. The tool can also inspect nearby DLL/TPM modules when looking for an extraction filter.
 
+### Use a recovered Nana profile for a dls: archive
+
+When the name state and Cabbage content parameters are already available for an
+ordinary XP3 archive, supply them as a local JSON profile.
+
+```bash
+xp3brute inspect fgimage.xp3 --nana-profile profile.json
+xp3brute unpack fgimage.xp3 out --nana-profile profile.json
+```
+
+The profile has two fields.
+
+- `name_state` is an array of six unsigned 32-bit words in the order of the
+  initialized Nana decoder state.
+- `content` contains the unsigned 32-bit `mask`, `offset`, and `random_seed`,
+  the `prolog_order`, `even_branch_order`, and `odd_branch_order` arrays
+  (permutations of 0–2, 0–7, and 0–5), and `control_block_file`. This file
+  contains the 4,096-byte table in the representation consumed by the
+  content filter. A relative path is resolved against the profile's directory.
+
+The CLI checks the name table against the archive's filename tokens and
+Adler-32 values. Before extracting, it verifies the supplied content profile
+against the protected entries. Keep application-specific profile data local.
+
 ### What happens automatically
 
 ```mermaid
