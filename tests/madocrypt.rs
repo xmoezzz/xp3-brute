@@ -84,7 +84,7 @@ fn tjs_chunk(tag: &[u8; 4], data: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn tjs(strings: &[&str], layer_function: bool) -> Vec<u8> {
+fn tjs(strings: &[&str], has_function: bool) -> Vec<u8> {
     let mut data = vec![0; 20]; // empty byte, short, int, long and double pools
     data.extend((strings.len() as u32).to_le_bytes());
     for text in strings {
@@ -97,8 +97,8 @@ fn tjs(strings: &[&str], layer_function: bool) -> Vec<u8> {
     }
     data.extend([0; 4]); // octet count
     let mut objects = 0i32.to_le_bytes().to_vec();
-    objects.extend((layer_function as i32).to_le_bytes());
-    if layer_function {
+    objects.extend((has_function as i32).to_le_bytes());
+    if has_function {
         let mut function = vec![0; 14 * 4]; // object fields, source positions and code counts
         function.extend(4i32.to_le_bytes());
         for i in 1i16..=4 {
@@ -296,4 +296,112 @@ fn auto_madocrypt_accepts_samples_larger_than_four_mib() {
     unpack(&archive, &output, false);
     assert_eq!(fs::read(output.join("first.tlg")).unwrap(), first);
     assert_eq!(fs::read(output.join("second.tlg")).unwrap(), second);
+}
+
+fn const_tjs(text: &str) -> Vec<u8> {
+    [0xff, 0xfe]
+        .into_iter()
+        .chain(text.encode_utf16().flat_map(u16::to_le_bytes))
+        .collect()
+}
+
+#[test]
+fn auto_madocrypt_restores_ev_definitions_and_layers_from_packaged_tjs() {
+    let dir = TestDir::new();
+    let alphabet = (0x4e00..0x4f00)
+        .map(|code| char::from_u32(code).unwrap())
+        .collect::<String>();
+    let event_loader = tjs(
+        &["loadInfo", "event_", "getSHA256Name", ".tlg", "evalStorage"],
+        true,
+    );
+    let gallery = const_tjs(
+        r#"(const) %[ "sample" => (const) [
+        (const) %[ "thum" => "ev_not_cataloged", "events" => (const) [
+            (const) %[ "name" => "ev_fixture" ], (const) %[ "name" => "ev_fixture" ]
+        ] ]
+    ] ]"#,
+    );
+    fixture_xp3(
+        &dir.join("data.xp3"),
+        &[
+            ("utils.tjs".into(), tjs(&[&alphabet], false)),
+            ("biscrat_kagenvevent.tjs".into(), event_loader),
+            ("init_cg.tjs".into(), gallery),
+        ],
+    );
+
+    let normal = token("event_ev_fixture");
+    let large = token("event_ev_fixture_大");
+    let uncataloged = token("event_ev_not_cataloged");
+    let first_name = token("fixture-ev-image");
+    let second_name = token("fixture-ev-image-large");
+    let missing_name = token("fixture-missing-ev-image");
+    let orphan = token("fixture-orphan-ev-image");
+    let stem = |name: &str| name.trim_end_matches(".tlg").to_owned();
+    let make_definition = |image: &str| {
+        const_tjs(&format!(
+            r#"(const) %[
+          "keys" => (const) ["5", "10"],
+          "info" => (const) %[
+            "10" => (const) %[ "layerNumber" => 20, "filename" => "{}", "condition" => void ],
+            "5" => (const) %[ "layerNumber" => 7, "filename" => "{}",
+                             "condition" => "command(\"表情\")" ]
+          ],
+          "filename" => (const) %[ "表情" => (const) [5] ]
+        ]"#,
+            stem(&missing_name),
+            stem(image)
+        ))
+    };
+    let normal_definition = make_definition(&first_name);
+    let large_definition = make_definition(&second_name);
+    let png_name = format!("{}.png", stem(&first_name));
+    let png = b"\x89PNG\r\n\x1a\nnative PNG".to_vec();
+    let first = b"TLG0.0\0sds\x1afixture EV normal".to_vec();
+    let second = b"TLG0.0\0sds\x1afixture EV large".to_vec();
+    let orphan_image = b"TLG0.0\0sds\x1afixture unreferenced".to_vec();
+    let archive = dir.join("arc/evimage.xp3");
+    let entries = vec![
+        (normal.clone(), normal_definition.clone()),
+        (large.clone(), large_definition.clone()),
+        (first_name.clone(), first.clone()),
+        (second_name.clone(), second.clone()),
+        (orphan.clone(), orphan_image.clone()),
+        (png_name.clone(), png.clone()),
+        (uncataloged.clone(), normal_definition.clone()),
+    ];
+    fixture_xp3(&archive, &entries);
+
+    let physical = dir.join("physical");
+    unpack(&archive, &physical, false);
+    for (name, contents) in &entries {
+        assert_eq!(&fs::read(physical.join(name)).unwrap(), contents);
+    }
+    assert!(!physical.join("event_ev_fixture.tlg").exists());
+
+    let named = dir.join("named");
+    let log = unpack(&archive, &named, true);
+    assert!(log.contains("route=yakimochi-ev mapped=4"));
+    for (name, contents) in [
+        ("event_ev_fixture.tlg", &normal_definition),
+        ("event_ev_fixture_大.tlg", &large_definition),
+        ("ev_fixture_7.tlg", &first),
+        ("ev_fixture_大_7.tlg", &second),
+        (&orphan, &orphan_image),
+        (&png_name, &png),
+        (&uncataloged, &normal_definition),
+    ] {
+        assert_eq!(&fs::read(named.join(name)).unwrap(), contents);
+    }
+    for name in [
+        normal.as_str(),
+        &large,
+        &first_name,
+        &second_name,
+        &missing_name,
+        "ev_fixture_20.tlg",
+    ] {
+        assert!(!named.join(name).exists(), "{name}");
+    }
 }

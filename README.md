@@ -124,7 +124,7 @@ xp3brute unpack data.xp3 out --exe game.exe
 
 `--exe` may point to the game executable. The tool can also inspect nearby DLL/TPM modules when looking for an extraction filter.
 
-### MadoCrypt archives and Yakimochi foreground filenames
+### MadoCrypt archives and Yakimochi filenames
 
 `unpack` can infer a MadoCrypt seed from protected TLG and KBAD100 headers
 and verify it against complete entries. It can use a nearby `fgimage.xp3` to
@@ -132,16 +132,26 @@ learn the seed for a companion archive, then check the companion's own
 Adler-32 values before enabling the filter. Keep the original game layout when
 extracting companion archives.
 
-Yakimochi Stream's foreground archive also supports logical filename recovery.
+Yakimochi Stream's foreground and event archives support logical filename recovery.
 
 ```bash
 xp3brute unpack "game/arc/fgimage.xp3" out --restore-names
+xp3brute unpack "game/arc/evimage.xp3" out-ev --restore-names
 ```
 
-This option reads the game's `data.xp3` and the foreground archive. It uses the
-TJS2 filename constants and KBAD100 layer definitions to restore paths of the
-form `<pose_base>_<level>_<layer_id>.tlg`. Metadata and unreferenced images keep
-their indexed paths. The default extraction uses the indexed names throughout.
+This option reads the game's `data.xp3` alongside the selected image archive.
+For `fgimage.xp3`, it uses TJS2 constants and KBAD100 definitions to restore paths
+of the form `<pose_base>_<level>_<layer_id>.tlg`. Foreground metadata keeps its
+indexed paths.
+
+For `evimage.xp3`, it uses the event loader, `init_cg.tjs`, and the archive's
+serialized `(const)` definitions. Definitions use `event_<event>.tlg` and the
+layers they reference use `<event>_<layerNumber>.tlg`. The Large variant keeps
+the `_大` suffix in `<event>`. The definition files retain their original
+extension and UTF-16LE data, including their internal layer references.
+
+Unreferenced entries and native PNG files keep their indexed paths. Default
+extraction uses indexed paths for every entry.
 
 ### What happens automatically
 

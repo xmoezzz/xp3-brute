@@ -7963,18 +7963,18 @@ fn unpack(
     }
 
     let mado_filter = madocrypt::MadoCrypt::recover(archive);
-    let aliases = if restore_names {
+    let (name_route, aliases) = if restore_names {
         let filter = mado_filter
             .ok_or_else(|| cli_error("--restore-names requires a verified MadoCrypt archive"))?;
         yakimochi::recover_names(archive, filter)?
     } else {
-        HashMap::new()
+        ("", HashMap::new())
     };
     if mado_filter.is_some() {
         eprintln!("[content-filter] route=madocrypt archive-samples=verified");
     }
     if restore_names {
-        eprintln!("[names         ] route=yakimochi-fgd mapped={}", aliases.len());
+        eprintln!("[names         ] route={name_route} mapped={}", aliases.len());
     }
 
     reset_compute_telemetry();
