@@ -1,3 +1,4 @@
+use crate::cxdec_names::cxdec_filename_md5_token;
 use crate::error::{Error, Result};
 use flate2::read::ZlibDecoder;
 use std::collections::HashMap;
@@ -16,6 +17,7 @@ const TAG_SEGM: u32 = 0x6d67_6573; // "segm"
 const TAG_ADLR: u32 = 0x726c_6461; // "adlr"
 const TAG_TIME: u32 = 0x656d_6974; // "time"
 const TAG_HXV4: u32 = 0x3476_7848; // "Hxv4" little-endian
+const TAG_HNFN: u32 = u32::from_le_bytes(*b"hnfn");
 
 /// Stable ASCII prefix stored in the Hxv4 protected-warning pseudo entry.
 /// The localized suffix varies, so detection deliberately stops at this prefix.
@@ -423,6 +425,9 @@ impl Archive {
             return Err(Error::format("unreachable XP3 index parser state"));
         }
 
+        if archive.hxv4.is_none() {
+            apply_hnfn_names(&mut archive.root_chunks, &mut archive.entries);
+        }
         archive.prune_hxv4_protected_warning_entry()?;
         archive.initialize_special_index_blobs();
         Ok(archive)
@@ -893,6 +898,58 @@ impl Archive {
     }
 }
 
+fn apply_hnfn_names(root_chunks: &mut [RootChunk], entries: &mut Vec<Entry>) {
+    let mut names: HashMap<_, Option<String>> = HashMap::new();
+    for root in root_chunks
+        .iter()
+        .filter(|root| root.magic == TAG_HNFN && root.kind == RootKind::AlternateName)
+    {
+        let (Some(name), Some(adler)) = (root.inferred_name.as_deref(), root.inferred_hash) else {
+            continue;
+        };
+        let key = (cxdec_filename_md5_token("", name), adler);
+        names
+            .entry(key)
+            .and_modify(|existing| {
+                if existing.as_deref() != Some(name) {
+                    *existing = None;
+                }
+            })
+            .or_insert_with(|| Some(name.to_string()));
+    }
+
+    if names.is_empty() {
+        return;
+    }
+
+    // Keep the on-disk token in Entry::name for round-tripping. The alternate
+    // name is only valid when both the token and the File checksum agree.
+    entries.retain_mut(|entry| {
+        if entry.alternate_name.is_some() || entry.name.len() != 32 {
+            return true;
+        }
+        let Some(adler) = entry.adler else {
+            return true;
+        };
+        let key = (entry.name.to_ascii_lowercase(), adler);
+        let Some(Some(name)) = names.get(&key) else {
+            return true;
+        };
+        if is_protected_dummy_name(name) {
+            if let Some(index) = entry.root_chunk_index {
+                let root = &mut root_chunks[index];
+                root.kind = RootKind::ProtectedFile;
+                root.inferred_name = Some(name.clone());
+                root.inferred_hash = Some(adler);
+            }
+            return false;
+        }
+        entry.alternate_name = Some(name.clone());
+        entry.alternate_hash = Some(adler);
+        true
+    });
+}
+
 fn walk_root_chunks(
     decoded: &[u8],
     block_index: usize,
@@ -946,6 +1003,11 @@ fn walk_root_chunks(
                 }
                 // Hxv4 does not use an M2 alternate-name record for its synthetic
                 // lookup ids. Do not let a stale heuristic name bleed across it.
+                *pending_alt_name = None;
+                *pending_alt_hash = None;
+            }
+            RootKind::AlternateName if root.magic == TAG_HNFN => {
+                // The hnfn table can be grouped separately from the File nodes.
                 *pending_alt_name = None;
                 *pending_alt_hash = None;
             }
@@ -1533,6 +1595,10 @@ mod tests {
     }
 
     fn make_xp3_named(payload: &[u8], compressed_index: bool, name: &str) -> Vec<u8> {
+        make_test_xp3(payload, &make_file_chunk(payload, name), compressed_index)
+    }
+
+    fn make_file_chunk(payload: &[u8], name: &str) -> Vec<u8> {
         let name: Vec<u16> = name.encode_utf16().collect();
 
         let mut info = Vec::new();
@@ -1555,9 +1621,11 @@ mod tests {
         file_body.extend_from_slice(&chunk(b"info", &info));
         file_body.extend_from_slice(&chunk(b"segm", &segm));
         file_body.extend_from_slice(&chunk(b"adlr", &adler32(payload).to_le_bytes()));
-        let index = chunk(b"File", &file_body);
+        chunk(b"File", &file_body)
+    }
 
-        let index_offset = data_offset + payload.len() as u64;
+    fn make_test_xp3(payload: &[u8], index: &[u8], compressed_index: bool) -> Vec<u8> {
+        let index_offset = XP3_MAGIC.len() as u64 + 8 + payload.len() as u64;
         let mut archive = Vec::new();
         archive.extend_from_slice(&XP3_MAGIC);
         archive.extend_from_slice(&index_offset.to_le_bytes());
@@ -1565,7 +1633,7 @@ mod tests {
 
         if compressed_index {
             let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-            encoder.write_all(&index).unwrap();
+            encoder.write_all(index).unwrap();
             let encoded = encoder.finish().unwrap();
             archive.push(INDEX_ZLIB);
             archive.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
@@ -1574,7 +1642,7 @@ mod tests {
         } else {
             archive.push(INDEX_RAW);
             archive.extend_from_slice(&(index.len() as u64).to_le_bytes());
-            archive.extend_from_slice(&index);
+            archive.extend_from_slice(index);
         }
         archive
     }
@@ -1632,6 +1700,79 @@ mod tests {
         archive.extend_from_slice(&(index.len() as u64).to_le_bytes());
         archive.extend_from_slice(&index);
         archive
+    }
+
+    fn make_name_chunk(tag: &[u8; 4], hash: u32, name: &str) -> Vec<u8> {
+        let mut record = hash.to_le_bytes().to_vec();
+        record.extend_from_slice(&(name.encode_utf16().count() as u16).to_le_bytes());
+        record.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
+        record.extend_from_slice(&[0, 0]);
+        chunk(tag, &record)
+    }
+
+    #[test]
+    fn grouped_hnfn_matches_md5_and_adler_instead_of_root_order() {
+        use crate::cxdec_names::cxdec_filename_md5_token;
+
+        let payload = b"shared test payload";
+        let hash = adler32(payload);
+        let first = r"画像\Portrait.PNG";
+        let second = "scene/表情.bin";
+        let warning = format!("{PROTECTED_DUMMY_PREFIX} {}.txt", "警告".repeat(160));
+        let first_token = cxdec_filename_md5_token("", first).to_ascii_uppercase();
+        let second_token = cxdec_filename_md5_token("", second);
+        let warning_token = cxdec_filename_md5_token("", &warning);
+
+        let mut index = make_name_chunk(b"hnfn", hash, second);
+        index.extend(make_name_chunk(b"hnfn", hash, first));
+        index.extend(make_name_chunk(b"hnfn", hash, &warning));
+        index.extend(make_file_chunk(payload, &first_token));
+        index.extend(make_file_chunk(payload, &warning_token));
+        index.extend(make_file_chunk(payload, &second_token));
+        index.extend(make_file_chunk(payload, "startup.tjs"));
+
+        let archive = Archive::from_bytes(make_test_xp3(payload, &index, true)).unwrap();
+        assert_eq!(archive.entries.len(), 3);
+        assert_eq!(archive.entries[0].name, first_token);
+        assert_eq!(archive.entries[0].preferred_name(), first);
+        assert_eq!(archive.entries[0].alternate_hash, Some(hash));
+        assert_eq!(archive.entries[1].name, second_token);
+        assert_eq!(archive.entries[1].preferred_name(), second);
+        assert_eq!(archive.entries[2].preferred_name(), "startup.tjs");
+        assert_eq!(archive.entries[2].alternate_name, None);
+        assert_eq!(archive.reconstruct_entry(0).unwrap(), payload);
+        assert_eq!(archive.reconstruct_entry(1).unwrap(), payload);
+        assert_eq!(archive.root_chunks[4].kind, RootKind::ProtectedFile);
+        assert_eq!(
+            archive.root_chunks[4].inferred_name.as_deref(),
+            Some(warning.as_str())
+        );
+    }
+
+    #[test]
+    fn grouped_hnfn_keeps_unverified_tokens_and_legacy_adjacent_names() {
+        use crate::cxdec_names::cxdec_filename_md5_token;
+
+        let payload = b"test payload";
+        let hash = adler32(payload);
+        let wrong_checksum = cxdec_filename_md5_token("", "wrong.bin");
+        let ambiguous = cxdec_filename_md5_token("", "same.bin");
+        let same = "same.bin";
+        let legacy = "legacy/表情.bin";
+
+        let mut index = make_name_chunk(b"hnfn", hash ^ 1, "wrong.bin");
+        index.extend(make_name_chunk(b"hnfn", hash, same));
+        index.extend(make_name_chunk(b"hnfn", hash, "SAME.bin"));
+        index.extend(make_file_chunk(payload, &wrong_checksum));
+        index.extend(make_file_chunk(payload, &ambiguous));
+        index.extend(make_name_chunk(b"Yuzu", hash, legacy));
+        index.extend(make_file_chunk(payload, "legacy-token"));
+
+        let archive = Archive::from_bytes(make_test_xp3(payload, &index, false)).unwrap();
+        assert_eq!(archive.entries.len(), 3);
+        assert_eq!(archive.entries[0].preferred_name(), wrong_checksum);
+        assert_eq!(archive.entries[1].preferred_name(), ambiguous);
+        assert_eq!(archive.entries[2].preferred_name(), legacy);
     }
 
     #[test]
