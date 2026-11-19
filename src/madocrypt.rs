@@ -5,6 +5,7 @@ use xp3_brute::{adler32, Archive, Entry};
 
 const STATE_MASK: u32 = 0x7fff_ffff;
 const PERIOD: usize = 31;
+const SAMPLE_SIZE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const PROTECTED: u32 = 0x8000_0000;
 const SIGNATURES: &[&[u8]] = &[
     b"TLG0.0\0sds\x1a",
@@ -102,7 +103,7 @@ impl MadoCrypt {
             .filter_map(|(index, entry)| {
                 let adler = protected(entry)?;
                 let name = entry.name.rsplit('.').next()?;
-                (name.eq_ignore_ascii_case("tlg") && entry.original_size <= 4 * 1024 * 1024)
+                (name.eq_ignore_ascii_case("tlg") && entry.original_size <= SAMPLE_SIZE_LIMIT)
                     .then_some((index, adler))
             });
         for (index, adler) in entries.take(32) {
@@ -135,7 +136,7 @@ impl MadoCrypt {
         entries.sort_unstable();
         let mut matches = 0;
         for &(size, index, adler) in &entries {
-            if matches >= 3 || (matches > 0 && size > 4 * 1024 * 1024) {
+            if matches >= 3 || (matches > 0 && size > SAMPLE_SIZE_LIMIT) {
                 break;
             }
             let Ok(mut data) = archive.reconstruct_entry(index) else {

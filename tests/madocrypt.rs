@@ -238,4 +238,62 @@ fn auto_madocrypt_restores_only_referenced_foreground_names_when_requested() {
     assert!(fs::read(named.join(fgd_token))
         .unwrap()
         .starts_with(b"KBAD100\0"));
+
+    // An indexed path must not collide with a restored name on case-insensitive filesystems.
+    let mut files = vec![
+        (first_token, first),
+        (second_token, second),
+        (orphan_token, orphan),
+        ("FG_SAMPLE_0_7.TLG".into(), b"existing file".to_vec()),
+    ];
+    let original = xp3_brute::Archive::open(&fg).unwrap();
+    for (index, entry) in original.entries.iter().enumerate().skip(3) {
+        let mut bytes = original.reconstruct_entry(index).unwrap();
+        let checksum = entry.adler.unwrap();
+        let state = (SEED ^ checksum) & 0x7fff_ffff;
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            let shift = (i * 8) % 31;
+            *byte ^= ((state >> shift) | (state << (31 - shift))) as u8;
+        }
+        files.push((entry.name.clone(), bytes));
+    }
+    fixture_xp3(&fg, &files);
+    let collision_output = dir.join("collision-output");
+    let result = Command::new(env!("CARGO_BIN_EXE_xp3brute"))
+        .arg("unpack")
+        .arg(&fg)
+        .arg(&collision_output)
+        .args([
+            "--no-exe-auto",
+            "--no-progress",
+            "--compute",
+            "cpu",
+            "--restore-names",
+        ])
+        .output()
+        .unwrap();
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("collides with an output path"));
+    assert!(!collision_output.exists());
+}
+
+#[test]
+fn auto_madocrypt_accepts_samples_larger_than_four_mib() {
+    let dir = TestDir::new();
+    let archive = dir.join("large.xp3");
+    let mut first = b"TLG5.0\0raw\x1a".to_vec();
+    first.resize(4 * 1024 * 1024 + 1, 0x42);
+    let mut second = b"TLG6.0\0raw\x1a".to_vec();
+    second.resize(4 * 1024 * 1024 + 2, 0x53);
+    fixture_xp3(
+        &archive,
+        &[
+            ("first.tlg".into(), first.clone()),
+            ("second.tlg".into(), second.clone()),
+        ],
+    );
+    let output = dir.join("large-output");
+    unpack(&archive, &output, false);
+    assert_eq!(fs::read(output.join("first.tlg")).unwrap(), first);
+    assert_eq!(fs::read(output.join("second.tlg")).unwrap(), second);
 }

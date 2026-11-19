@@ -125,7 +125,10 @@ pub(crate) fn recover_names(
 
     let mut aliases = HashMap::new();
     let mut metadata = config_indices;
-    let mut output_names = HashSet::new();
+    let mut output_names: HashSet<String> = indexed
+        .keys()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
     for (character, pose, base) in poses {
         let count = levels
             .get(character)
@@ -162,8 +165,7 @@ pub(crate) fn recover_names(
                     }
                     continue;
                 }
-                if indexed.contains_key(filename.as_str()) || !output_names.insert(filename.clone())
-                {
+                if !output_names.insert(filename.to_ascii_lowercase()) {
                     return Err(invalid(
                         "a restored layer name collides with an output path",
                     ));
