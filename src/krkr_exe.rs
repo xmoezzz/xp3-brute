@@ -574,31 +574,16 @@ pub fn discover_game_executables(
 fn find_resource_salt_rva(bytes: &[u8], pe: &PeFile<'_>) -> Result<u32, String> {
     let image_base = pe_image_base(bytes)?;
     let mut matches = Vec::new();
-    let mut pos = 0usize;
-    while pos + 0x21 <= bytes.len() {
-        if bytes[pos] == 0x83
-            && bytes[pos + 1] == 0x3d
-            && bytes[pos + 6] == 0x00
-            && bytes[pos + 7] == 0x0f
-            && bytes[pos + 8] == 0x86
-            && bytes[pos + 13] == 0xc7
-            && bytes[pos + 14] == 0x05
-            && bytes[pos + 23] == 0xc7
-            && bytes[pos + 24] == 0x05
-            && bytes[pos + 29..pos + 33] == [0x00, 0x20, 0x00, 0x00]
-        {
-            let va = le_u32(&bytes[pos + 19..pos + 23]) as u64;
-            if va >= image_base {
-                let rva64 = va - image_base;
-                if rva64 <= u32::MAX as u64 {
-                    let rva = rva64 as u32;
-                    if pe.derva_slice::<u8>(rva, RESOURCE_SALT_LEN).is_ok() {
-                        matches.push(rva);
-                    }
-                }
+    for pos in 0..bytes.len().saturating_sub(0x20) {
+        let Some(pointer) = resource_salt_pointer_field(&bytes[pos..]) else {
+            continue;
+        };
+        let va = le_u32(pointer) as u64;
+        if let Some(rva) = va.checked_sub(image_base).and_then(|v| u32::try_from(v).ok()) {
+            if pe.derva_slice::<u8>(rva, RESOURCE_SALT_LEN).is_ok() {
+                matches.push(rva);
             }
         }
-        pos += 1;
     }
     matches.sort_unstable();
     matches.dedup();
@@ -614,6 +599,45 @@ fn find_resource_salt_rva(bytes: &[u8], pe: &PeFile<'_>) -> Result<u32, String> 
                 matches.len()
             ))
         }
+    }
+}
+
+fn resource_salt_pointer_field(bytes: &[u8]) -> Option<&[u8]> {
+    if bytes.get(..2)? != [0x83, 0x3d] || bytes.get(6..9)? != [0x00, 0x0f, 0x86] {
+        return None;
+    }
+
+    // HanaganeKanadeGram loads ESI from an absolute address before the two stores.
+    let stores = if bytes.get(13..15)? == [0x8b, 0x35] { 19 } else { 13 };
+    let pair = bytes.get(stores..stores + 20)?;
+    if pair[..2] != [0xc7, 0x05]
+        || pair[10..12] != [0xc7, 0x05]
+        || pair[16..20] != (RESOURCE_SALT_LEN as u32).to_le_bytes()
+    {
+        return None;
+    }
+    Some(&pair[6..10])
+}
+
+#[cfg(test)]
+mod bres_salt_pattern_regression {
+    use super::resource_salt_pointer_field;
+
+    #[test]
+    fn accepts_immediate_and_esi_load_variants() {
+        let prefix = [0x83, 0x3d, 0, 0, 0, 0, 0, 0x0f, 0x86, 0, 0, 0, 0];
+        let load = [0x8b, 0x35, 1, 2, 3, 4];
+        let pair = [
+            0xc7, 0x05, 1, 2, 3, 4, 0x00, 0x10, 0x40, 0x00,
+            0xc7, 0x05, 5, 6, 7, 8, 0x00, 0x20, 0x00, 0x00,
+        ];
+        let baseline = [&prefix[..], &pair[..]].concat();
+        let mut variant = [&prefix[..], &load[..], &pair[..]].concat();
+        assert_eq!(resource_salt_pointer_field(&baseline), Some(&pair[6..10]));
+        assert_eq!(resource_salt_pointer_field(&variant), Some(&pair[6..10]));
+        assert_eq!(resource_salt_pointer_field(&variant[..38]), None);
+        variant[36] = 0x10;
+        assert_eq!(resource_salt_pointer_field(&variant), None);
     }
 }
 

@@ -74,6 +74,7 @@ use xp3_brute::{
     PSB_ROOT_JSON_SCHEMA,
 };
 
+mod hxv4_sprites;
 mod madocrypt;
 mod yakimochi;
 
@@ -7962,8 +7963,10 @@ fn unpack(
         };
     }
 
+    let restore_hxv4_names = restore_names && archive.is_hxv4();
+    let restore_mado_names = restore_names && !restore_hxv4_names;
     let mado_filter = madocrypt::MadoCrypt::recover(archive);
-    let aliases = if restore_names {
+    let aliases = if restore_mado_names {
         let filter = mado_filter
             .ok_or_else(|| cli_error("--restore-names requires a verified MadoCrypt archive"))?;
         yakimochi::recover_names(archive, filter)?
@@ -7973,7 +7976,7 @@ fn unpack(
     if mado_filter.is_some() {
         eprintln!("[content-filter] route=madocrypt archive-samples=verified");
     }
-    if restore_names {
+    if restore_mado_names {
         eprintln!("[names         ] route=yakimochi-fgd mapped={}", aliases.len());
     }
 
@@ -8182,17 +8185,29 @@ fn unpack(
     }
 
     if let Some(index) = hx_index.as_mut() {
-        let before_entries = index.entries.iter().filter(|e| e.archive_slot == 0).count();
+        let physical_ids = restore_hxv4_names.then(|| {
+            archive.entries.iter().filter_map(|entry| entry.hxv4_id).collect::<HashSet<_>>()
+        });
+        let is_current = |entry: &Hxv4IndexEntry| {
+            entry.archive_slot == 0 && physical_ids.as_ref().is_none_or(|ids| ids.contains(&entry.id))
+        };
+        let before_entries = index.entries.iter().filter(|e| is_current(e)).count();
         let before_resolved = index
             .entries
             .iter()
-            .filter(|e| e.archive_slot == 0 && e.name.is_some())
+            .filter(|e| is_current(e) && e.name.is_some())
             .count();
         eprintln!(
             "Hxv4 special index decrypted: entries={} current_archive_entries={} resolved_plaintext_names={} hash_only={}",
             index.entries.len(), before_entries, before_resolved, before_entries.saturating_sub(before_resolved)
         );
-        if before_resolved != before_entries {
+        if before_resolved != before_entries && restore_hxv4_names {
+            let manager = hx_native_filter.as_ref().ok_or_else(|| {
+                cli_error("HXV4 --restore-names needs a native content filter from the game EXE")
+            })?;
+            let restored = hxv4_sprites::recover(archive, index, manager);
+            eprintln!("[hxv4-names   ] sprite definitions restored names={restored}");
+        } else if before_resolved != before_entries {
             eprintln!("Hxv4 note: hash-only names detected; starting the game-wide filename bootstrap before any ordinary content recovery.");
             bootstrap_hxv4_names(
                 archive,
@@ -8208,11 +8223,11 @@ fn unpack(
                 &mut xp3_meta,
             )?;
         }
-        let current_entries = index.entries.iter().filter(|e| e.archive_slot == 0).count();
+        let current_entries = index.entries.iter().filter(|e| is_current(e)).count();
         let resolved_current = index
             .entries
             .iter()
-            .filter(|e| e.archive_slot == 0 && e.name.is_some())
+            .filter(|e| is_current(e) && e.name.is_some())
             .count();
         let explicit_hx_keys = hx_options.keys()?;
         populate_hxv4_meta(
@@ -8223,7 +8238,11 @@ fn unpack(
             hx_native_recovery.as_ref(),
             hx_native_filter.as_ref(),
         );
-        if !hxv4_names_complete(current_entries, resolved_current) {
+        if !hxv4_names_complete(current_entries, resolved_current) && restore_hxv4_names {
+            eprintln!(
+                "[hxv4-names   ] current={resolved_current}/{current_entries}; verified unnamed entries will use _hxv4_hash paths"
+            );
+        } else if !hxv4_names_complete(current_entries, resolved_current) {
             eprintln!(
                 "[hxv4-names   ] fixed-point current={}/{} unresolved={}; recovered named plaintexts were written directly under {} and all bootstrap/TJS2 diagnostics stayed internal",
                 resolved_current,
