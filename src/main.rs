@@ -74,6 +74,9 @@ use xp3_brute::{
     PSB_ROOT_JSON_SCHEMA,
 };
 
+mod madocrypt;
+mod yakimochi;
+
 thread_local! {
     static X86_WORKER_RUNTIME: std::cell::RefCell<Option<(String, X86Xp3FilterRuntime)>> =
         const { std::cell::RefCell::new(None) };
@@ -1729,6 +1732,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut special = SpecialCliOptions::default();
             let mut progress = true;
             let mut verbose = false;
+            let mut restore_names = false;
             let mut decode_options = UnpackDecodeOptions::default();
             let mut unpacker_all = false;
             let mut x86_filter_target: Option<PathBuf> = None;
@@ -1834,6 +1838,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     "--no-progress" => progress = false,
                     "--verbose" => verbose = true,
+                    "--restore-names" => restore_names = true,
                     other => {
                         return Err(cli_error(format!("unknown unpack option: {other}")).into())
                     }
@@ -1886,6 +1891,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                 x86_filter_target.as_deref(),
                 progress,
                 verbose,
+                restore_names,
             )?;
         }
         "xor-recover" => {
@@ -6233,7 +6239,8 @@ enum UnpackState {
         gpu_adapter: Option<String>,
         combinations: u128,
     },
-    NativeCxdecRecovered {
+    NativeFilterRecovered {
+        method: &'static str,
         format: String,
         parameters: String,
         hash: u32,
@@ -7942,6 +7949,7 @@ fn unpack(
     cxdec_scan_target: Option<&Path>,
     progress_enabled: bool,
     verbose: bool,
+    restore_names: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // `unpack` performs many probes.  The default view deliberately reports
     // only lifecycle states, progress, and the final summary; `--verbose`
@@ -7952,6 +7960,21 @@ fn unpack(
                 ::std::eprintln!($($arg)*);
             }
         };
+    }
+
+    let mado_filter = madocrypt::MadoCrypt::recover(archive);
+    let aliases = if restore_names {
+        let filter = mado_filter
+            .ok_or_else(|| cli_error("--restore-names requires a verified MadoCrypt archive"))?;
+        yakimochi::recover_names(archive, filter)?
+    } else {
+        HashMap::new()
+    };
+    if mado_filter.is_some() {
+        eprintln!("[content-filter] route=madocrypt archive-samples=verified");
+    }
+    if restore_names {
+        eprintln!("[names         ] route=yakimochi-fgd mapped={}", aliases.len());
     }
 
     reset_compute_telemetry();
@@ -8410,7 +8433,7 @@ fn unpack(
     let mut validated_x86_filter: Option<ValidatedX86Filter> = None;
     let mut x86_filter_module_sha: Option<String> = None;
 
-    if global_key.is_none() && !archive.is_hxv4() {
+    if mado_filter.is_none() && global_key.is_none() && !archive.is_hxv4() {
         let scan_target = automatic_cxdec_scan_target(
             archive,
             cxdec_scan_target,
@@ -8444,8 +8467,9 @@ fn unpack(
         }
     }
 
-    let native_content_filter_ready =
-        recovered_fixed_cxdec_engine.is_some() || validated_x86_filter.is_some();
+    let native_content_filter_ready = mado_filter.is_some()
+        || recovered_fixed_cxdec_engine.is_some()
+        || validated_x86_filter.is_some();
     if global_key.is_none() {
         if archive.is_hxv4() {
             eprintln!(
@@ -8667,7 +8691,10 @@ fn unpack(
         mut x86_runtime: Option<&mut X86Xp3FilterRuntime>,
     | -> Result<UnpackEntry, LibraryError> {
         let entry = &archive.entries[index];
-        let resolved_name = effective_entry_name(entry, index, ordered_names.as_ref());
+        let resolved_name = aliases
+            .get(&index)
+            .map(String::as_str)
+            .unwrap_or_else(|| effective_entry_name(entry, index, ordered_names.as_ref()));
 
         // The protected-archive warning node is deliberate metadata/noise.
         // Preserve it in the parsed archive/xp3-meta for round-tripping, but do
@@ -8795,6 +8822,48 @@ fn unpack(
             }
         }
 
+        if let (Some(filter), Some(adler)) = (mado_filter, entry.adler) {
+            if entry.flags & 0x8000_0000 != 0 {
+                filter.apply(adler, 0, &mut raw);
+                if xp3_brute::adler32(&raw) == adler {
+                    let format = strong_builtin_format(&raw)
+                        .unwrap_or_else(|| "adler-verified".to_string());
+                    let UserFacingTextResult {
+                        bytes,
+                        source_sha256,
+                        transform,
+                    } = user_facing_text_asset(Some(&format), raw);
+                    return Ok(UnpackEntry {
+                        index,
+                        name: resolved_name.to_string(),
+                        hxv4_id: None,
+                        bytes,
+                        storage_plaintext_sha256: Some(source_sha256),
+                        text_transform: transform,
+                        state: UnpackState::NativeFilterRecovered {
+                            method: "madocrypt",
+                            format,
+                            parameters: "inferred-madocrypt".to_string(),
+                            hash: adler,
+                        },
+                    });
+                }
+
+                // Preserve the input for diagnostics. A failed checksum under
+                // a verified native filter must not be treated as recovered.
+                filter.apply(adler, 0, &mut raw);
+                return Ok(UnpackEntry {
+                    index,
+                    name: resolved_name.to_string(),
+                    hxv4_id: None,
+                    bytes: raw,
+                    storage_plaintext_sha256: None,
+                    text_transform: None,
+                    state: UnpackState::Unresolved,
+                });
+            }
+        }
+
         // A pure-Rust content engine may be used only after its external fixed
         // parameters have been recovered from the supplied game files. Accept
         // each entry only when the archive's original adlr matches after
@@ -8833,7 +8902,8 @@ fn unpack(
                         bytes,
                         storage_plaintext_sha256: Some(source_sha256),
                         text_transform: transform,
-                        state: UnpackState::NativeCxdecRecovered {
+                        state: UnpackState::NativeFilterRecovered {
+                            method: "native-cxdec",
                             format,
                             parameters: "recovered-native-cxdec".to_string(),
                             hash: file_hash,
@@ -9314,9 +9384,16 @@ fn unpack(
                     push_transform_unique(entry_meta, TransformMeta::KirikiriText(transform));
                 }
             }
+            let relative_path = |format| {
+                if mado_filter.is_some() {
+                    safe_relative_path(&item.name, item.index)
+                } else {
+                    solved_item_relative_path(&item, format)
+                }
+            };
             match &item.state {
                 UnpackState::PlainRaw { format } => {
-                    let relative = solved_item_relative_path(&item, format.as_deref());
+                    let relative = relative_path(format.as_deref());
                     let logical = item.name.replace('\\', "/");
                     let output = out_dir.join(&relative);
                     let asset =
@@ -9356,7 +9433,7 @@ fn unpack(
                     gpu_adapter,
                     combinations,
                 } => {
-                    let relative = solved_item_relative_path(&item, Some(format.as_str()));
+                    let relative = relative_path(Some(format.as_str()));
                     let logical = item.name.replace('\\', "/");
                     let output = out_dir.join(&relative);
                     let asset =
@@ -9410,12 +9487,13 @@ fn unpack(
                     report.push(format!("{}\trecovered\t{}\t{}\t{}\t{}\t{}\tperiod={};brute={};mitm={};gpu={};adapter={};combinations={}",
                         item.index, report_name, report_info_name, report_hx_id, report_field(format), report_field(&output.display().to_string()), period, brute_used, mitm, gpu, report_field(gpu_adapter.as_deref().unwrap_or("-")), combinations));
                 }
-                UnpackState::NativeCxdecRecovered {
+                UnpackState::NativeFilterRecovered {
+                    method,
                     format,
                     parameters,
                     hash,
                 } => {
-                    let relative = solved_item_relative_path(&item, Some(format.as_str()));
+                    let relative = relative_path(Some(format.as_str()));
                     let logical = item.name.replace('\\', "/");
                     let output = out_dir.join(&relative);
                     let asset =
@@ -9428,7 +9506,7 @@ fn unpack(
                         out_dir,
                     );
                     if let Some(entry_meta) = xp3_meta.entries.get_mut(item.index) {
-                        entry_meta.recovery.status = "native-cxdec".to_string();
+                        entry_meta.recovery.status = (*method).to_string();
                         entry_meta.recovery.format = Some(format.clone());
                         entry_meta.recovery.detail = Some(format!(
                             "parameters={};hash=0x{:08x};validation=adlr-or-strong-format", parameters, hash
@@ -9438,13 +9516,14 @@ fn unpack(
                     solved += 1;
                     if verbose {
                         println!(
-                            "entry[{}] native-cxdec parameters={} format={} hash=0x{:08x} {}",
-                            item.index, parameters, format, hash, output.display()
+                            "entry[{}] {} parameters={} format={} hash=0x{:08x} {}",
+                            item.index, method, parameters, format, hash, output.display()
                         );
                     }
                     report.push(format!(
-                        "{}\tnative-cxdec\t{}\t{}\t{}\t{}\t{}\tparameters={};hash=0x{:08x};verified=adlr-or-strong-format",
+                        "{}\t{}\t{}\t{}\t{}\t{}\t{}\tparameters={};hash=0x{:08x};verified=adlr-or-strong-format",
                         item.index,
+                        method,
                         report_name,
                         report_info_name,
                         report_hx_id,
@@ -9461,7 +9540,7 @@ fn unpack(
                     source,
                     hash,
                 } => {
-                    let relative = solved_item_relative_path(&item, Some(format.as_str()));
+                    let relative = relative_path(Some(format.as_str()));
                     let logical = item.name.replace('\\', "/");
                     let output = out_dir.join(&relative);
                     let asset =
@@ -9518,7 +9597,7 @@ fn unpack(
                     right_xor,
                     corrections,
                 } => {
-                    let relative = solved_item_relative_path(&item, Some(format.as_str()));
+                    let relative = relative_path(Some(format.as_str()));
                     let logical = item.name.replace('\\', "/");
                     let output = out_dir.join(&relative);
                     let asset =
@@ -9575,7 +9654,7 @@ fn unpack(
                     corrections,
                     gpu,
                 } => {
-                    let relative = solved_item_relative_path(&item, Some(format.as_str()));
+                    let relative = relative_path(Some(format.as_str()));
                     let logical = item.name.replace('\\', "/");
                     let output = out_dir.join(&relative);
                     let asset =
@@ -10841,7 +10920,7 @@ fn usage() {
                   [--special-xor-key HEX --special-xor-scope prefix|whole]\n\
                   [--exe game.exe] [--no-exe-auto] [--hx-key HEX64 --hx-nonce HEX48] [--hx-names HxNames.lst]\n\
                   [--name-dict FILE] [--hx-game-dir DIR] [--no-hx-name-bootstrap]\n\
-                  [--filter-exe game.exe|module.dll|plugin.tpm|game-dir]\n\
+                  [--filter-exe game.exe|module.dll|plugin.tpm|game-dir] [--restore-names]\n\
                   [--unpacker-all] [--tjs emit|decompile|none] [--tlg png|jpg|bmp|none]\n\
                   [--psb all|json|png|jpg|bmp|none] [--pbd json|none] [--amv png|none]\n\
                   [--no-progress] [--verbose]\n\
