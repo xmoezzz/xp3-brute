@@ -148,6 +148,25 @@ The CLI checks the name table against the archive's filename tokens and
 Adler-32 values. Before extracting, it verifies the supplied content profile
 against the protected entries. Keep application-specific profile data local.
 
+### MadoCrypt archives and Yakimochi foreground filenames
+
+`unpack` can infer a MadoCrypt seed from protected TLG and KBAD100 headers
+and verify it against complete entries. It can use a nearby `fgimage.xp3` to
+learn the seed for a companion archive, then check the companion's own
+Adler-32 values before enabling the filter. Keep the original game layout when
+extracting companion archives.
+
+Yakimochi Stream's foreground archive also supports logical filename recovery.
+
+```bash
+xp3brute unpack "game/arc/fgimage.xp3" out --restore-names
+```
+
+This option reads the game's `data.xp3` and the foreground archive. It uses the
+TJS2 filename constants and KBAD100 layer definitions to restore paths of the
+form `<pose_base>_<level>_<layer_id>.tlg`. Metadata and unreferenced images keep
+their indexed paths. The default extraction uses the indexed names throughout.
+
 ### What happens automatically
 
 ```mermaid
