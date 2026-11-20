@@ -75,6 +75,7 @@ use xp3_brute::{
 };
 
 mod madocrypt;
+mod nana;
 mod yakimochi;
 
 thread_local! {
@@ -294,8 +295,9 @@ fn parse_hx_option(
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 struct SpecialCliOptions {
+    nana_profile: Option<nana::NanaProfile>,
     xor_key: Option<String>,
     xor_scope: SpecialXorScope,
     max_xor_period: usize,
@@ -304,6 +306,7 @@ struct SpecialCliOptions {
 impl Default for SpecialCliOptions {
     fn default() -> Self {
         Self {
+            nana_profile: None,
             xor_key: None,
             xor_scope: SpecialXorScope::Prefix100,
             max_xor_period: 1024,
@@ -320,6 +323,22 @@ impl SpecialCliOptions {
             None => Ok(None),
         }
     }
+}
+
+fn parse_nana_option(
+    rest: &[String],
+    i: &mut usize,
+    special: &mut SpecialCliOptions,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    if rest[*i] != "--nana-profile" {
+        return Ok(false);
+    }
+    *i += 1;
+    let value = rest
+        .get(*i)
+        .ok_or_else(|| cli_error("missing --nana-profile file"))?;
+    special.nana_profile = Some(nana::NanaProfile::load(Path::new(value))?);
+    Ok(true)
 }
 
 fn parse_special_option(
@@ -1566,7 +1585,9 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             let mut special = SpecialCliOptions::default();
             let mut i = 0usize;
             while i < rest.len() {
-                if parse_special_option(&rest, &mut i, &mut special)? {
+                if parse_nana_option(&rest, &mut i, &mut special)?
+                    || parse_special_option(&rest, &mut i, &mut special)?
+                {
                     i += 1;
                     continue;
                 }
@@ -1583,8 +1604,11 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            let ordered_names =
-                recover_ordered_names_with_hx_options(&archive, &hx, &special, true)?;
+            let ordered_names = if let Some(profile) = special.nana_profile.as_ref() {
+                Some(profile.recover_names(&archive)?)
+            } else {
+                recover_ordered_names_with_hx_options(&archive, &hx, &special, true)?
+            };
             inspect(&archive, ordered_names.as_ref());
             inspect_hx_index(&archive, hx_index.as_ref())?;
         }
@@ -1763,6 +1787,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
                         | "--no-hx-name-bootstrap"
                 ) {
                     parse_hx_option(&rest, &mut i, &mut hx)?;
+                    i += 1;
+                    continue;
+                }
+                if parse_nana_option(&rest, &mut i, &mut special)? {
                     i += 1;
                     continue;
                 }
@@ -7962,6 +7990,23 @@ fn unpack(
         };
     }
 
+    // Check the supplied profile before touching the output directory.
+    let (nana_names, nana_engine) = if let Some(profile) = special_options.nana_profile.as_ref() {
+        let names = profile.recover_names(archive)?;
+        let engine = profile.content_engine()?;
+        let validation =
+            validate_cxdec_params_on_entries(archive, &engine, Some(&names), 0..archive.entries.len())?
+                .filter(|evidence| evidence.adler_matches > 0)
+                .ok_or_else(|| cli_error("Nana content profile did not validate against the XP3"))?;
+        eprintln!(
+            "[cxdec-params   ] route=nana-profile adlr={}/{}",
+            validation.adler_matches, validation.adler_tested
+        );
+        (Some(names), Some(Arc::new(engine)))
+    } else {
+        (None, None)
+    };
+
     let mado_filter = madocrypt::MadoCrypt::recover(archive);
     let (name_route, aliases) = if restore_names {
         let filter = mado_filter
@@ -8091,12 +8136,16 @@ fn unpack(
             );
         }
     }
-    let ordered_names = recover_ordered_names_with_hx_options(
-        archive,
-        hx_options,
-        special_options,
-        progress_enabled,
-    )?;
+    let ordered_names = if nana_names.is_some() {
+        nana_names
+    } else {
+        recover_ordered_names_with_hx_options(
+            archive,
+            hx_options,
+            special_options,
+            progress_enabled,
+        )?
+    };
     if let Some(names) = &ordered_names {
         eprintln!(
             "[special-index ] candidate accepted root={} decoder={} layout={} names={} confidence={} decoded_size={} elapsed={:.3}s",
@@ -8429,11 +8478,15 @@ fn unpack(
     let special_content_key_accepted = global_key
         .as_ref()
         .is_some_and(|key| key.source == GlobalKeySource::SpecialIndex);
-    let mut recovered_fixed_cxdec_engine: Option<Arc<CxdecEngine>> = None;
+    let mut recovered_fixed_cxdec_engine = nana_engine;
     let mut validated_x86_filter: Option<ValidatedX86Filter> = None;
     let mut x86_filter_module_sha: Option<String> = None;
 
-    if mado_filter.is_none() && global_key.is_none() && !archive.is_hxv4() {
+    if recovered_fixed_cxdec_engine.is_none()
+        && mado_filter.is_none()
+        && global_key.is_none()
+        && !archive.is_hxv4()
+    {
         let scan_target = automatic_cxdec_scan_target(
             archive,
             cxdec_scan_target,
@@ -9385,7 +9438,7 @@ fn unpack(
                 }
             }
             let relative_path = |format| {
-                if mado_filter.is_some() {
+                if special_options.nana_profile.is_some() || mado_filter.is_some() {
                     safe_relative_path(&item.name, item.index)
                 } else {
                     solved_item_relative_path(&item, format)
@@ -10902,6 +10955,7 @@ fn usage() {
            filter-apply <module.dll|plugin.tpm> <input> <output> --hash N [--offset N] [--trace-code]\n\
            exe-analyze <game.exe> [--archive data.xp3] [--dump-bootstrap FILE] [--dump-startup FILE]\n\
            inspect <archive> [--special-max-period 1..4096] [--special-xor-key HEX]\n\
+                   [--nana-profile FILE]\n\
                    [--special-xor-scope prefix|whole]\n\
                    [--exe game.exe] [--no-exe-auto] [--hx-key HEX64 --hx-nonce HEX48]\n\
                    [--hx-names HxNames.lst] [--name-dict FILE]\n\
@@ -10920,7 +10974,7 @@ fn usage() {
                   [--special-xor-key HEX --special-xor-scope prefix|whole]\n\
                   [--exe game.exe] [--no-exe-auto] [--hx-key HEX64 --hx-nonce HEX48] [--hx-names HxNames.lst]\n\
                   [--name-dict FILE] [--hx-game-dir DIR] [--no-hx-name-bootstrap]\n\
-                  [--filter-exe game.exe|module.dll|plugin.tpm|game-dir] [--restore-names]\n\
+                  [--filter-exe game.exe|module.dll|plugin.tpm|game-dir] [--nana-profile FILE] [--restore-names]\n\
                   [--unpacker-all] [--tjs emit|decompile|none] [--tlg png|jpg|bmp|none]\n\
                   [--psb all|json|png|jpg|bmp|none] [--pbd json|none] [--amv png|none]\n\
                   [--no-progress] [--verbose]\n\
