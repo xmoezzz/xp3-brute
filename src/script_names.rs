@@ -443,14 +443,14 @@ fn parse_tjs_references(src: &str) -> Vec<ScriptReference> {
         }
     }
 
-    // key = "value" and key: "value" capture storage-like properties.
+    // Assignments and dictionary members capture storage-like properties.
     for i in 0..tokens.len().saturating_sub(2) {
         let key = match &tokens[i].kind {
             TjsTokenKind::Ident(v) => v,
             TjsTokenKind::String(v) => v,
             _ => continue,
         };
-        let is_assign = matches!(&tokens[i + 1].kind, TjsTokenKind::Operator(op) if op == "=")
+        let is_assign = matches!(&tokens[i + 1].kind, TjsTokenKind::Operator(op) if matches!(op.as_str(), "=" | "=>"))
             || matches!(tokens[i + 1].kind, TjsTokenKind::Symbol(':'));
         if !is_assign {
             continue;

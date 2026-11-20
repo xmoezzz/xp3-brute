@@ -124,6 +124,23 @@ xp3brute unpack data.xp3 out --exe game.exe
 
 `--exe` may point to the game executable. The tool can also inspect nearby DLL/TPM modules when looking for an extraction filter.
 
+### HXV4 foreground filenames
+
+For an HXV4 foreground archive, `--restore-names` uses the game executable's
+native content filter and the archive's own standing definitions and layer
+tables. It checks every proposed basename against the authenticated filename
+hash and checks referenced TLG dimensions against the corresponding PBD or TXT
+table. It also checks bounded layer numbers under known table names for TLGs
+outside the active tables.
+
+```bash
+xp3brute unpack "game/fgimage.xp3" out --exe "game/game.exe" --restore-names
+```
+
+The option preserves known directory names and otherwise keeps the original
+path hash as the directory group. Verified entries with unknown names use the
+`_hxv4_hash` layout. `xp3-meta.yaml` records the archive identity and output path.
+
 ### Use a recovered Nana profile for a dls: archive
 
 When the name state and Cabbage content parameters are already available for an
