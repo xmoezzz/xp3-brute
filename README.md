@@ -141,7 +141,31 @@ The option preserves known directory names and otherwise keeps the original
 path hash as the directory group. Verified entries with unknown names use the
 `_hxv4_hash` layout. `xp3-meta.yaml` records the archive identity and output path.
 
-### MadoCrypt archives and Yakimochi foreground filenames
+### Use a recovered Nana profile for a dls: archive
+
+When the name state and Cabbage content parameters are already available for an
+ordinary XP3 archive, supply them as a local JSON profile.
+
+```bash
+xp3brute inspect fgimage.xp3 --nana-profile profile.json
+xp3brute unpack fgimage.xp3 out --nana-profile profile.json
+```
+
+The profile has two fields.
+
+- `name_state` is an array of six unsigned 32-bit words in the order of the
+  initialized Nana decoder state.
+- `content` contains the unsigned 32-bit `mask`, `offset`, and `random_seed`,
+  the `prolog_order`, `even_branch_order`, and `odd_branch_order` arrays
+  (permutations of 0–2, 0–7, and 0–5), and `control_block_file`. This file
+  contains the 4,096-byte table in the representation consumed by the
+  content filter. A relative path is resolved against the profile's directory.
+
+The CLI checks the name table against the archive's filename tokens and
+Adler-32 values. Before extracting, it verifies the supplied content profile
+against the protected entries. Keep application-specific profile data local.
+
+### MadoCrypt archives and Yakimochi filenames
 
 `unpack` can infer a MadoCrypt seed from protected TLG and KBAD100 headers
 and verify it against complete entries. It can use a nearby `fgimage.xp3` to
@@ -149,16 +173,26 @@ learn the seed for a companion archive, then check the companion's own
 Adler-32 values before enabling the filter. Keep the original game layout when
 extracting companion archives.
 
-Yakimochi Stream's foreground archive also supports logical filename recovery.
+Yakimochi Stream's foreground and event archives support logical filename recovery.
 
 ```bash
 xp3brute unpack "game/arc/fgimage.xp3" out --restore-names
+xp3brute unpack "game/arc/evimage.xp3" out-ev --restore-names
 ```
 
-This option reads the game's `data.xp3` and the foreground archive. It uses the
-TJS2 filename constants and KBAD100 layer definitions to restore paths of the
-form `<pose_base>_<level>_<layer_id>.tlg`. Metadata and unreferenced images keep
-their indexed paths. The default extraction uses the indexed names throughout.
+This option reads the game's `data.xp3` alongside the selected image archive.
+For `fgimage.xp3`, it uses TJS2 constants and KBAD100 definitions to restore paths
+of the form `<pose_base>_<level>_<layer_id>.tlg`. Foreground metadata keeps its
+indexed paths.
+
+For `evimage.xp3`, it uses the event loader, `init_cg.tjs`, and the archive's
+serialized `(const)` definitions. Definitions use `event_<event>.tlg` and the
+layers they reference use `<event>_<layerNumber>.tlg`. The Large variant keeps
+the `_大` suffix in `<event>`. The definition files retain their original
+extension and UTF-16LE data, including their internal layer references.
+
+Unreferenced entries and native PNG files keep their indexed paths. Default
+extraction uses indexed paths for every entry.
 
 ### What happens automatically
 

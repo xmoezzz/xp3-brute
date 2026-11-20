@@ -1,4 +1,6 @@
+mod event;
 mod kbad;
+mod tjs_const;
 
 use std::collections::{HashMap, HashSet};
 use std::io::{Error, ErrorKind, Result};
@@ -21,40 +23,74 @@ struct Naming {
 
 impl Naming {
     fn token(&self, logical: &str) -> String {
-        let mut hash = Sha256::new();
-        for unit in logical.encode_utf16() {
-            hash.update(unit.to_le_bytes());
-        }
-        let mut token: String = hash
-            .finalize()
-            .iter()
-            .map(|byte| self.alphabet[*byte as usize])
-            .collect();
-        token.push_str(".tlg");
-        token
+        token(&self.alphabet, logical)
     }
 }
+
+fn token(alphabet: &[char; 256], logical: &str) -> String {
+    let mut hash = Sha256::new();
+    for unit in logical.encode_utf16() {
+        hash.update(unit.to_le_bytes());
+    }
+    let mut token: String = hash
+        .finalize()
+        .iter()
+        .map(|byte| alphabet[*byte as usize])
+        .collect();
+    token.push_str(".tlg");
+    token
+}
+
+pub(crate) type NameAliases = HashMap<usize, String>;
 
 pub(crate) fn recover_names(
     archive: &Archive,
     filter: MadoCrypt,
-) -> Result<HashMap<usize, String>> {
+) -> Result<(&'static str, NameAliases)> {
     let path = archive
         .path
         .as_deref()
-        .filter(|path| {
-            path.file_name()
-                .is_some_and(|name| name.eq_ignore_ascii_case("fgimage.xp3"))
-        })
-        .ok_or_else(|| invalid("--restore-names requires a MadoCrypt fgimage.xp3"))?;
+        .ok_or_else(|| invalid("--restore-names requires an archive path"))?;
+    let is_archive = |expected| {
+        path.file_name()
+            .is_some_and(|name| name.eq_ignore_ascii_case(expected))
+    };
+    let is_event = is_archive("evimage.xp3");
+    if !is_event && !is_archive("fgimage.xp3") {
+        return Err(invalid(
+            "--restore-names requires a MadoCrypt fgimage.xp3 or evimage.xp3",
+        ));
+    }
 
     let data_path = data_archive(path)
-        .ok_or_else(|| invalid("could not find the game's data.xp3 next to fgimage.xp3"))?;
+        .ok_or_else(|| invalid("could not find the game's data.xp3 near the image archive"))?;
     let data = Archive::open(data_path).map_err(Error::other)?;
     let utils = load_script(&data, filter, "utils.tjs")?;
-    let layers = load_script(&data, filter, "psdlayer.tjs")?;
-    let character = load_script(&data, filter, "kagenvcharacterex.tjs")?;
-    let naming = naming_rules(&utils, &layers)?;
+    let alphabet = filename_alphabet(&utils)?;
+    if is_event {
+        return Ok((
+            "yakimochi-ev",
+            event::recover(archive, &data, filter, &alphabet)?,
+        ));
+    }
+    Ok((
+        "yakimochi-fgd",
+        recover_foreground(archive, &data, filter, alphabet)?,
+    ))
+}
+
+fn recover_foreground(
+    archive: &Archive,
+    data: &Archive,
+    filter: MadoCrypt,
+    alphabet: [char; 256],
+) -> Result<NameAliases> {
+    let layers = load_script(data, filter, "psdlayer.tjs")?;
+    let character = load_script(data, filter, "kagenvcharacterex.tjs")?;
+    let naming = Naming {
+        alphabet,
+        salt: foreground_salt(&layers)?,
+    };
 
     let indexed: HashMap<_, _> = archive
         .entries
@@ -192,6 +228,11 @@ fn data_archive(path: &Path) -> Option<PathBuf> {
 }
 
 fn load_script(archive: &Archive, filter: MadoCrypt, name: &str) -> Result<Tjs2File> {
+    load_tjs2_bytecode(&read_named_asset(archive, filter, name)?)
+        .map_err(|_| invalid(format!("could not parse {name} as TJS2")))
+}
+
+fn read_named_asset(archive: &Archive, filter: MadoCrypt, name: &str) -> Result<Vec<u8>> {
     let entry = only(
         archive
             .entries
@@ -200,55 +241,58 @@ fn load_script(archive: &Archive, filter: MadoCrypt, name: &str) -> Result<Tjs2F
             .filter_map(|(index, entry)| entry.name.eq_ignore_ascii_case(name).then_some(index)),
     )
     .ok_or_else(|| invalid(format!("could not identify {name} in data.xp3")))?;
-    load_tjs2_bytecode(&read_asset(archive, entry, filter)?)
-        .map_err(|_| invalid(format!("could not parse {name} as TJS2")))
+    read_asset(archive, entry, filter)
 }
 
-fn naming_rules(utils: &Tjs2File, layers: &Tjs2File) -> Result<Naming> {
-    let alphabet = only(utils.const_pools.strings.iter().filter_map(|text| {
+fn filename_alphabet(utils: &Tjs2File) -> Result<[char; 256]> {
+    only(utils.const_pools.strings.iter().filter_map(|text| {
         let chars: [char; 256] = text.chars().collect::<Vec<_>>().try_into().ok()?;
         (chars.iter().copied().collect::<HashSet<_>>().len() == chars.len()
             && chars.iter().all(|c| c.len_utf16() == 1 && !c.is_control()))
         .then_some(chars)
     }))
-    .ok_or_else(|| invalid("could not identify the filename alphabet in utils.tjs"))?;
+    .ok_or_else(|| invalid("could not identify the filename alphabet in utils.tjs"))
+}
+
+fn function_literals<'a>(script: &'a Tjs2File, name: &str) -> Option<HashSet<&'a str>> {
     let function = only(
-        layers
+        script
             .objects
             .iter()
-            .filter(|object| object.name.as_deref() == Some("getLayerImageName")),
+            .filter(|object| object.name.as_deref() == Some(name)),
+    )?;
+    Some(
+        function
+            .data
+            .iter()
+            .filter_map(|variant| match variant {
+                Variant::String(index) => script.const_pools.strings.get(*index as usize),
+                _ => None,
+            })
+            .map(String::as_str)
+            .collect(),
     )
-    .ok_or_else(|| invalid("could not identify getLayerImageName in psdlayer.tjs"))?;
-    let literals: HashSet<_> = function
-        .data
-        .iter()
-        .filter_map(|variant| match variant {
-            Variant::String(index) => layers.const_pools.strings.get(*index as usize),
-            _ => None,
-        })
-        .map(String::as_str)
-        .collect();
+}
+
+fn foreground_salt(layers: &Tjs2File) -> Result<String> {
+    let literals = function_literals(layers, "getLayerImageName")
+        .ok_or_else(|| invalid("could not identify getLayerImageName in psdlayer.tjs"))?;
     if !literals.contains("getSHA256Name") || !literals.contains("_") {
         return Err(invalid("unexpected layer filename function"));
     }
-    let salt = only(
+    only(
         literals
             .into_iter()
             .filter(|value| !matches!(*value, "" | "_" | "System" | "getSHA256Name")),
     )
-    .ok_or_else(|| invalid("could not identify the layer filename salt"))?;
-    Ok(Naming {
-        alphabet,
-        salt: salt.to_string(),
-    })
+    .map(str::to_owned)
+    .ok_or_else(|| invalid("could not identify the layer filename salt"))
 }
 
 fn read_asset(archive: &Archive, index: usize, filter: MadoCrypt) -> Result<Vec<u8>> {
     let entry = &archive.entries[index];
     if entry.original_size > METADATA_LIMIT {
-        return Err(invalid(
-            "TJS or KBAD filename metadata exceeds the size limit",
-        ));
+        return Err(invalid("filename metadata exceeds the size limit"));
     }
     let checksum = entry
         .adler
