@@ -128,7 +128,8 @@ xp3brute unpack data.xp3 out --exe game.exe
 
 For an HXV4 foreground archive, `--restore-names` uses the game executable's
 native content filter and the archive's own standing definitions and layer
-tables. It checks every proposed basename against the authenticated filename
+tables. It also reads CP932 stand metadata and can use the character list in a
+sibling data.xp3 for additional stand aliases. It checks every proposed basename against the authenticated filename
 hash and checks referenced TLG dimensions against the corresponding PBD or TXT
 table. It also checks bounded layer numbers under known table names for TLGs
 outside the active tables.

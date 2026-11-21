@@ -1,4 +1,5 @@
-use encoding_rs::{UTF_16BE, UTF_16LE};
+use super::{hxv4_game_root, load_hx_index, HxCliOptions};
+use encoding_rs::{SHIFT_JIS, UTF_16BE, UTF_16LE};
 use std::collections::{HashMap, HashSet};
 
 use xp3_brute::decoder::tlg::inspect_tlg;
@@ -12,6 +13,7 @@ type Dimensions = (u32, u32);
 type EntryHash = (Group, [u8; 32]);
 
 const METADATA_LIMIT: usize = 2 * 1024 * 1024;
+const CHARACTER_LIST_LIMIT: u64 = 64 * 1024;
 const MAX_TIER: u32 = 4;
 const MAX_EXTRA_LAYER_ID: u32 = 10_000;
 
@@ -56,6 +58,7 @@ pub(super) fn recover(
     archive: &Archive,
     index: &mut Hxv4Index,
     filter: &Hxv4NativeFilterManager,
+    options: &HxCliOptions,
 ) -> usize {
     let by_id: HashMap<_, _> = archive
         .entries
@@ -78,26 +81,91 @@ pub(super) fn recover(
         let Some(&(entry, checksum)) = by_id.get(&record.id) else {
             continue;
         };
-        let Ok(mut payload) = archive.reconstruct_entry(entry) else {
+        let Some(payload) = verified_payload(archive, filter, record, entry, checksum) else {
             continue;
         };
-        filter
-            .state_for_entry(record.entry_key, record.filter_flag)
-            .apply(0, &mut payload);
-        if adler32(&payload) != checksum {
-            continue;
-        }
         if let Some(asset) = read_asset(&payload) {
             catalog.assets.insert(position, asset);
         }
     }
-    resolve_catalog(index, catalog)
+    resolve_catalog(index, catalog, || {
+        sibling_stand_aliases(archive, filter, options)
+    })
 }
 
-fn resolve_catalog(index: &mut Hxv4Index, mut catalog: Catalog) -> usize {
+fn verified_payload(
+    archive: &Archive,
+    filter: &Hxv4NativeFilterManager,
+    record: &Hxv4IndexEntry,
+    entry: usize,
+    checksum: u32,
+) -> Option<Vec<u8>> {
+    let mut payload = archive.reconstruct_entry(entry).ok()?;
+    filter
+        .state_for_entry(record.entry_key, record.filter_flag)
+        .apply(0, &mut payload);
+    (adler32(&payload) == checksum).then_some(payload)
+}
+
+fn sibling_stand_aliases(
+    foreground: &Archive,
+    filter: &Hxv4NativeFilterManager,
+    options: &HxCliOptions,
+) -> HashSet<String> {
+    let Some(root) = hxv4_game_root(foreground, options) else {
+        return HashSet::new();
+    };
+    let path = root.join("data.xp3");
+    if foreground.path.as_ref().is_some_and(|current| {
+        current
+            .canonicalize()
+            .ok()
+            .is_some_and(|current| path.canonicalize().ok().as_ref() == Some(&current))
+    }) {
+        return HashSet::new();
+    }
+    let Ok(archive) = Archive::open(path) else {
+        return HashSet::new();
+    };
+    let Ok(Some(index)) = load_hx_index(&archive, options) else {
+        return HashSet::new();
+    };
+    let records: HashMap<_, _> = index
+        .entries
+        .iter()
+        .filter(|record| record.archive_slot == 0)
+        .map(|record| (record.id, record))
+        .collect();
+    let mut aliases = HashSet::new();
+    for (position, entry) in archive.entries.iter().enumerate() {
+        if entry.original_size > CHARACTER_LIST_LIMIT {
+            continue;
+        }
+        let Some((record, checksum)) = entry
+            .hxv4_id
+            .and_then(|id| records.get(&id))
+            .zip(entry.adler)
+        else {
+            continue;
+        };
+        if let Some(source) = verified_payload(&archive, filter, record, position, checksum)
+            .and_then(|payload| read_text(&payload))
+        {
+            aliases.extend(character_stand_aliases(&source).map(str::to_owned));
+        }
+    }
+    aliases
+}
+
+fn resolve_catalog(
+    index: &mut Hxv4Index,
+    mut catalog: Catalog,
+    external_aliases: impl FnOnce() -> HashSet<String>,
+) -> usize {
     let groups: HashSet<_> = catalog.matches.keys().map(|(group, _)| *group).collect();
     let mut models = HashSet::new();
     let mut aliases = HashSet::new();
+    let mut stands = HashSet::new();
     for (position, asset) in &catalog.assets {
         let group = index.entries[*position].path_hash;
         let Asset::Text {
@@ -112,9 +180,15 @@ fn resolve_catalog(index: &mut Hxv4Index, mut catalog: Catalog) -> usize {
             "emotion.csv",
             "emotion.txt",
             "facezoom.csv",
+            "standposition.txt",
         ] {
             if catalog.lookup(group, name) == Some(*position) {
                 catalog.names.insert(*position, name.to_owned());
+                if name == "standposition.txt" {
+                    for model in stand_position_models(source) {
+                        models.insert(model.to_owned());
+                    }
+                }
             }
         }
         let (definition_models, definition_aliases) = read_definitions(
@@ -125,6 +199,9 @@ fn resolve_catalog(index: &mut Hxv4Index, mut catalog: Catalog) -> usize {
             source,
         );
         aliases.extend(definition_aliases);
+        if stand_source(source).is_some() {
+            stands.insert(*position);
+        }
         for model in definition_models {
             if !model.starts_with("face") {
                 models.insert(format!("face{model}"));
@@ -137,20 +214,47 @@ fn resolve_catalog(index: &mut Hxv4Index, mut catalog: Catalog) -> usize {
     // tables live in separate character directories. Only the table-to-image
     // link is constrained to a directory.
     for alias in aliases {
-        claim_table(&mut catalog, &groups, &alias, "sinfo");
+        claim_asset(&mut catalog, &groups, &alias, "sinfo");
     }
     for model in models {
+        let role = model
+            .rsplit_once('_')
+            .filter(|(_, variant)| {
+                !variant.is_empty() && variant.bytes().all(|b| b.is_ascii_digit())
+            })
+            .map_or(model.as_str(), |(role, _)| role);
+        let role = if role == model {
+            role.trim_end_matches(|ch: char| ch.is_ascii_digit())
+        } else {
+            role
+        };
+        for stem in [model.as_str(), role] {
+            if valid_basename(stem) {
+                claim_asset(&mut catalog, &groups, &format!("{stem}.stand"), "stand");
+            }
+        }
         for stem in std::iter::once(model.clone())
             .chain((0..=MAX_TIER).map(|tier| format!("{model}_{tier}")))
         {
             for extension in ["sinfo", "pbd", "txt"] {
-                claim_table(
+                claim_asset(
                     &mut catalog,
                     &groups,
                     &format!("{stem}.{extension}"),
                     extension,
                 );
             }
+        }
+    }
+
+    // Character lists in data.xp3 can name distinct .stand entries that all
+    // reference the same model. Only search the sibling if local models left
+    // stand definitions unnamed.
+    if stands.iter().any(|position| {
+        !catalog.names.contains_key(position) && index.entries[*position].name.is_none()
+    }) {
+        for alias in external_aliases() {
+            claim_asset(&mut catalog, &groups, &alias, "stand");
         }
     }
 
@@ -237,7 +341,7 @@ fn case_folded_path(record: &Hxv4IndexEntry, name: &str) -> String {
         .to_lowercase()
 }
 
-fn claim_table(catalog: &mut Catalog, groups: &HashSet<Group>, name: &str, extension: &str) {
+fn claim_asset(catalog: &mut Catalog, groups: &HashSet<Group>, name: &str, extension: &str) {
     let hash = hxv4_filename_hash(name);
     for group in groups {
         let Some(Some(position)) = catalog.matches.get(&(*group, hash)) else {
@@ -254,6 +358,10 @@ fn claim_table(catalog: &mut Catalog, groups: &HashSet<Group>, name: &str, exten
                     })
                 )
                 | ("sinfo", Some(Asset::Text { layers: None, .. }))
+        ) || matches!(
+            (extension, catalog.assets.get(position)),
+            ("stand", Some(Asset::Text { source, layers: None }))
+                if stand_source(source).is_some()
         ) {
             catalog.names.insert(*position, name.to_owned());
         }
@@ -289,6 +397,12 @@ fn read_asset(bytes: &[u8]) -> Option<Asset> {
         let document = decode_pbd(bytes).ok()?;
         return Some(Asset::Table(pbd_layers(&document.root)?));
     }
+    let source = read_text(bytes)?;
+    let layers = text_layers(&source);
+    Some(Asset::Text { source, layers })
+}
+
+fn read_text(bytes: &[u8]) -> Option<String> {
     let unwrapped = decode_kirikiri_text(bytes);
     let bytes = unwrapped.as_deref().unwrap_or(bytes);
     let source = if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
@@ -301,7 +415,10 @@ fn read_asset(bytes: &[u8]) -> Option<Asset> {
             .into_owned()
     } else {
         std::str::from_utf8(bytes)
-            .ok()?
+            .map_or_else(
+                |_| SHIFT_JIS.decode_without_bom_handling_and_without_replacement(bytes),
+                |text| Some(text.into()),
+            )?
             .trim_start_matches('\u{feff}')
             .to_owned()
     };
@@ -312,8 +429,7 @@ fn read_asset(bytes: &[u8]) -> Option<Asset> {
     {
         return None;
     }
-    let layers = text_layers(&source);
-    Some(Asset::Text { source, layers })
+    Some(source)
 }
 
 fn pbd_layers(root: &PbdValue) -> Option<Vec<Layer>> {
@@ -385,14 +501,15 @@ fn read_definitions(
     position: usize,
     source: &str,
 ) -> (Vec<String>, Vec<String>) {
-    let text = source.trim_start();
-    let text = text.strip_prefix("(const)").unwrap_or(text).trim_start();
-    if !(text.starts_with('[') || text.starts_with("%[")) || !text.contains("filename") {
+    let Some(text) = stand_source(source) else {
         return (
-            sinfo_stem(text).map(str::to_owned).into_iter().collect(),
+            sinfo_stem(source.trim_start())
+                .map(str::to_owned)
+                .into_iter()
+                .collect(),
             Vec::new(),
         );
-    }
+    };
     let Some(script) = analyze_script_names("stand.tjs", text.as_bytes()) else {
         return (Vec::new(), Vec::new());
     };
@@ -441,6 +558,41 @@ fn read_definitions(
     (models, aliases.into_iter().map(str::to_owned).collect())
 }
 
+fn stand_source(mut text: &str) -> Option<&str> {
+    text = text.trim_start();
+    while text.starts_with('#') {
+        text = text.split_once('\n')?.1.trim_start();
+    }
+    let text = text.strip_prefix("(const)").unwrap_or(text).trim_start();
+    ((text.starts_with('[') || text.starts_with("%[")) && text.contains("filename")).then_some(text)
+}
+
+fn stand_position_models(source: &str) -> impl Iterator<Item = &str> {
+    source.lines().filter_map(|line| {
+        let (model, options) = line.split_once('\t')?;
+        (!model.starts_with('#')
+            && valid_basename(model)
+            && options
+                .split('\t')
+                .step_by(2)
+                .any(|key| key == "leveloffset"))
+        .then_some(model)
+    })
+}
+
+fn character_stand_aliases(source: &str) -> impl Iterator<Item = &str> {
+    source.lines().filter_map(|line| {
+        let line = line.trim();
+        let (character, fields) = line.split_once(',')?;
+        let name = fields.split(',').next()?.trim().trim_matches('"');
+        (!character.starts_with('#')
+            && valid_basename(character.trim().trim_matches('"'))
+            && valid_basename(name)
+            && name.ends_with(".stand"))
+        .then_some(name)
+    })
+}
+
 fn sinfo_stem(text: &str) -> Option<&str> {
     let mut lines = text.lines();
     let stem = lines.next()?.split_once('\t')?.0.strip_prefix('#')?.trim();
@@ -462,6 +614,92 @@ fn valid_basename(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn catalog_for<const N: usize>(fixtures: [(u8, &str, Asset); N]) -> (Hxv4Index, Catalog) {
+        let mut index = Hxv4Index::default();
+        let mut catalog = Catalog::default();
+        for (position, (group, name, asset)) in fixtures.into_iter().enumerate() {
+            let path_hash = [group; 8];
+            let name_hash = hxv4_filename_hash(name);
+            index.entries.push(Hxv4IndexEntry {
+                record_index: position,
+                packed: position as u64,
+                id: position as u64,
+                archive_slot: 0,
+                filter_flag: 0,
+                entry_key: 0,
+                path_hash,
+                name_hash,
+                path: None,
+                name: None,
+            });
+            catalog
+                .matches
+                .entry((path_hash, name_hash))
+                .and_modify(|match_id| *match_id = None)
+                .or_insert(Some(position));
+            catalog.assets.insert(position, asset);
+        }
+        (index, catalog)
+    }
+
+    #[test]
+    fn recovers_cp932_stands_and_sinfo_from_character_metadata() {
+        let cp932 = |source: &str| {
+            let (bytes, _, errors) = encoding_rs::SHIFT_JIS.encode(source);
+            assert!(!errors);
+            read_asset(&bytes).unwrap()
+        };
+        let alias_list = "#役名,ファイル,位置\n影,影_鳥.stand,中央\n#未使用,影_未使用.stand\n";
+        let fixtures = [
+            (
+                1,
+                "standposition.txt",
+                cp932("#位置定義\n花_苗_1\tleveloffset\t[0]\txoffset\tint 0\n"),
+            ),
+            (
+                1,
+                "花_苗.stand",
+                cp932("#立ち絵定義\n[%[\"filename\"=>\"花1\"]]"),
+            ),
+            (1, "花.stand", cp932("[%[\"filename\"=>\"花2\"]]")),
+            (2, "花_苗_1.sinfo", cp932("#衣装定義\n衣装\t01\n")),
+            (
+                2,
+                "花1.txt",
+                cp932("#layer_type\tname\theight\tlayer_id\twidth\n0\t通常\t8\t3\t6\n"),
+            ),
+            (2, "花1_3.tlg", Asset::Tlg((6, 8))),
+            (2, "花1_2.tlg", Asset::Tlg((6, 8))),
+            (3, "影_鳥.stand", cp932("[%[\"filename\"=>\"影_魚\"]]")),
+            (3, "影_未使用.stand", cp932("[%[\"filename\"=>\"影_魚\"]]")),
+            (3, "unknown.sinfo", cp932("#出典不明\n衣装\t01\n")),
+        ];
+        let (mut index, catalog) = catalog_for(fixtures);
+        assert_eq!(
+            resolve_catalog(&mut index, catalog, || character_stand_aliases(alias_list)
+                .map(str::to_owned)
+                .collect()),
+            8
+        );
+        for (position, name) in [
+            "standposition.txt",
+            "花_苗.stand",
+            "花.stand",
+            "花_苗_1.sinfo",
+            "花1.txt",
+            "花1_3.tlg",
+            "花1_2.tlg",
+            "影_鳥.stand",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert_eq!(index.entries[position].name.as_deref(), Some(name));
+        }
+        assert!(index.entries[8..].iter().all(|entry| entry.name.is_none()));
+        assert!(read_asset(&[0x82]).is_none());
+    }
 
     #[test]
     fn follows_stand_layer_tables_and_keeps_ambiguous_or_unverified_names() {
@@ -490,31 +728,8 @@ mod tests {
             (1, "Name.sinfo", read_asset(b"definition").unwrap()),
             (1, "name.sinfo", read_asset(b"definition").unwrap()),
         ];
-        let mut index = Hxv4Index::default();
-        let mut catalog = Catalog::default();
-        for (position, (group, name, asset)) in fixtures.into_iter().enumerate() {
-            let path_hash = [group; 8];
-            let name_hash = hxv4_filename_hash(name);
-            index.entries.push(Hxv4IndexEntry {
-                record_index: position,
-                packed: position as u64,
-                id: position as u64,
-                archive_slot: 0,
-                filter_flag: 0,
-                entry_key: 0,
-                path_hash,
-                name_hash,
-                path: None,
-                name: None,
-            });
-            catalog
-                .matches
-                .entry((path_hash, name_hash))
-                .and_modify(|match_id| *match_id = None)
-                .or_insert(Some(position));
-            catalog.assets.insert(position, asset);
-        }
-        assert_eq!(resolve_catalog(&mut index, catalog), 6);
+        let (mut index, catalog) = catalog_for(fixtures);
+        assert_eq!(resolve_catalog(&mut index, catalog, HashSet::new), 6);
         for position in [0, 1, 2, 3, 5, 6] {
             assert_eq!(
                 hxv4_filename_hash(index.entries[position].name.as_deref().unwrap()),

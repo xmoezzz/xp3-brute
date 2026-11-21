@@ -8254,7 +8254,7 @@ fn unpack(
             let manager = hx_native_filter.as_ref().ok_or_else(|| {
                 cli_error("HXV4 --restore-names needs a native content filter from the game EXE")
             })?;
-            let restored = hxv4_sprites::recover(archive, index, manager);
+            let restored = hxv4_sprites::recover(archive, index, manager, hx_options);
             eprintln!("[hxv4-names   ] sprite definitions restored names={restored}");
         } else if before_resolved != before_entries {
             eprintln!("Hxv4 note: hash-only names detected; starting the game-wide filename bootstrap before any ordinary content recovery.");
