@@ -25,6 +25,7 @@ use crate::win32_host::{
 };
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use unicorn_engine::{
@@ -45,6 +46,18 @@ const GENERIC_TVP_STUB: u64 = HOST_BASE + 0x500;
 const EXPORTER_OBJ: u64 = HOST_BASE + 0x1000;
 const EXPORTER_VTBL: u64 = HOST_BASE + 0x1100;
 const INFO_ADDR: u64 = HOST_BASE + 0x2000;
+const QUERY_CDECL_RETURN: u64 = HOST_BASE + 0x210;
+const SEH_RETURN: u64 = HOST_BASE + 0x600;
+const SEH_RECORD: u64 = HOST_BASE + 0x3000;
+const SEH_CONTEXT: u64 = HOST_BASE + 0x3100;
+const SEH_DISPATCHER: u64 = HOST_BASE + 0x3400;
+const NO_SEH_FRAME: u32 = u32::MAX;
+const CONTEXT_DEBUG_REGISTERS: u32 = 0x10010;
+const CONTEXT_INTEGER_CONTROL: u32 = 0x10003;
+const EXE_HOST_PATH: &str = r"C:\game\game.exe";
+const MODULE_HOST_PATH: &str = r"C:\game\module.tpm";
+const LEGACY_SIDECAR: &str = "sigdata.t01";
+const LEGACY_FIND_HANDLE: u32 = 0x4445;
 const DYN_BASE: u64 = 0x6000_0000;
 const DYN_SIZE: u64 = 0x0100_0000;
 const INPUT_BASE: u64 = 0x5000_0000;
@@ -57,6 +70,7 @@ const CXDEC_PROLOGUE_BYTES: u32 = 9;
 const CXDEC_EPILOGUE_BYTES: u32 = 6;
 const MAX_STEPS: usize = 20_000_000;
 const TIMEOUT_US: u64 = 5_000_000;
+const LEGACY_HOST_TIMEOUT_US: u64 = 30_000_000;
 // Archive callbacks are linear in the entry size. A wall-clock timeout makes
 // otherwise deterministic emulation fail under parallel CPU contention, and
 // Unicorn reports timeout/count exhaustion as a normal stop. Bound callbacks
@@ -1672,6 +1686,18 @@ struct RuntimeExecutionProfile {
 }
 
 #[derive(Clone, Debug)]
+struct GuestException {
+    frame: u32,
+    continuable: bool,
+}
+
+struct LegacyHostFiles {
+    executable: Vec<u8>,
+    sidecar: Option<Vec<u8>>,
+    libraries: BTreeMap<String, Vec<u8>>,
+}
+
+#[derive(Clone, Debug)]
 struct EmuState {
     captured_callback: Option<u32>,
     requested_exports: Vec<String>,
@@ -1684,6 +1710,12 @@ struct EmuState {
     runtime_profile: RuntimeExecutionProfile,
     module_file: Vec<u8>,
     host_file: Vec<u8>,
+    real_host_file: bool,
+    legacy_sidecar: Option<Vec<u8>>,
+    legacy_libraries: BTreeMap<String, Vec<u8>>,
+    legacy_find_index: Option<usize>,
+    debug_registers: [u32; 6],
+    exception: Option<GuestException>,
     opened_file: Vec<u8>,
     file_cursor: usize,
     file_open: bool,
@@ -1722,6 +1754,12 @@ impl EmuState {
             runtime_profile: RuntimeExecutionProfile::default(),
             module_file,
             host_file,
+            real_host_file: false,
+            legacy_sidecar: None,
+            legacy_libraries: BTreeMap::new(),
+            legacy_find_index: None,
+            debug_registers: [0; 6],
+            exception: None,
             opened_file: Vec::new(),
             file_cursor: 0,
             file_open: false,
@@ -1796,7 +1834,7 @@ impl X86Xp3FilterRuntime {
     pub fn open(path: impl AsRef<Path>, trace_code: bool) -> Result<Self> {
         let path = path.as_ref();
         let pe = Pe32::from_path(path)?;
-        Self::open_pe(path.to_path_buf(), pe, trace_code)
+        Self::open_pe(path.to_path_buf(), pe, trace_code, read_legacy_host(path))
     }
 
     /// Open a filter from bytes retained in `xp3-meta.yaml`. This avoids a
@@ -1809,7 +1847,7 @@ impl X86Xp3FilterRuntime {
         let module = module_name.into();
         let normalized = crate::pe_normalize::normalize_pe_bytes(&bytes)?;
         let pe = Pe32::parse(normalized.bytes)?;
-        Self::open_pe(module, pe, trace_code)
+        Self::open_pe(module, pe, trace_code, None)
     }
 
     /// Build a sandboxed runtime around an explicitly discovered callback
@@ -1837,6 +1875,7 @@ impl X86Xp3FilterRuntime {
 
         let build_start = Instant::now();
         let mut uc = build_emulator(&pe, trace_code)?;
+        set_legacy_host(&mut uc, read_legacy_host(path));
         let emulator_build = build_start.elapsed();
 
         let ext = path
@@ -1894,12 +1933,18 @@ impl X86Xp3FilterRuntime {
         })
     }
 
-    fn open_pe(module: PathBuf, pe: Pe32, trace_code: bool) -> Result<Self> {
+    fn open_pe(
+        module: PathBuf,
+        pe: Pe32,
+        trace_code: bool,
+        host: Option<LegacyHostFiles>,
+    ) -> Result<Self> {
         let total_start = Instant::now();
         let static_candidates = collect_static_candidates(&pe);
 
         let build_start = Instant::now();
         let mut uc = build_emulator(&pe, trace_code)?;
+        set_legacy_host(&mut uc, host);
         let emulator_build = build_start.elapsed();
 
         let attach_start = Instant::now();
@@ -1912,11 +1957,18 @@ impl X86Xp3FilterRuntime {
         if let Some(v2_rva) = pe.export_rva("V2Link") {
             let v2_va = pe.image_base.wrapping_add(v2_rva);
             let phase_start = Instant::now();
-            if run_initialized_v2link_capture(&mut uc, &pe, v2_va).is_ok() {
-                callback = uc.get_data().captured_callback;
-                if callback.is_some() {
+            match run_initialized_v2link_capture(&mut uc, &pe, v2_va) {
+                Ok(registered) => {
+                    callback = Some(registered);
                     callback_source = Some("v2link-emulated-registration".to_string());
                 }
+                Err(err)
+                    if uc.get_data().real_host_file
+                        && uc.get_data().captured_callback.is_some() =>
+                {
+                    return Err(err);
+                }
+                Err(_) => {}
             }
             v2link = phase_start.elapsed();
         }
@@ -2214,6 +2266,12 @@ impl X86Xp3FilterRuntime {
         let emulate_start = Instant::now();
         let (timeout_us, instruction_limit) = if self.validated_production_execution {
             (CALLBACK_VALIDATED_TIMEOUT_US, 0)
+        } else if self.uc.get_data().real_host_file
+            && self.callback_source == "v2link-emulated-registration"
+        {
+            // This callback has already been registered by a completed V2Link.
+            // Archive sampling still checks each result and bounds every call.
+            (LEGACY_HOST_TIMEOUT_US, 0)
         } else {
             (0, CALLBACK_MAX_STEPS)
         };
@@ -2887,6 +2945,133 @@ fn executable_direct_call_targets(
     Ok(targets.into_iter().collect())
 }
 
+// The virtual file backing a legacy TPM must come from an unambiguous
+// companion executable in the game directory.
+fn read_legacy_host(module: &Path) -> Option<LegacyHostFiles> {
+    if !module.extension()?.to_str()?.eq_ignore_ascii_case("tpm") {
+        return None;
+    }
+    let mut root = module.parent()?;
+    if root
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("plugin"))
+    {
+        root = root.parent()?;
+    }
+    if root.as_os_str().is_empty() {
+        root = Path::new(".");
+    }
+    let mut candidates = None;
+    let mut library_paths = Vec::new();
+    for item in fs::read_dir(root).ok()? {
+        let entry = item.ok()?;
+        if !entry.file_type().ok()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        match path
+            .extension()
+            .and_then(|value| value.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("exe") if candidates.is_some() => return None,
+            Some("exe") => candidates = Some(path),
+            Some("dll" | "tpm") => library_paths.push(path),
+            _ => {}
+        }
+    }
+    let executable = read_virtual_file(&candidates?, 128 * 1024 * 1024)?;
+    if !executable.starts_with(b"MZ") {
+        return None;
+    }
+    let sidecar = read_virtual_file(&root.join(LEGACY_SIDECAR), 16 * 1024 * 1024);
+    let mut libraries = BTreeMap::new();
+    let mut library_budget = 32 * 1024 * 1024;
+    if library_paths.len() > 64 {
+        return None;
+    }
+    for path in library_paths {
+        let name = path.file_name()?.to_str()?.to_owned();
+        let bytes = read_virtual_file(&path, library_budget)?;
+        library_budget -= bytes.len() as u64;
+        libraries.insert(name, bytes);
+    }
+    Some(LegacyHostFiles {
+        executable,
+        sidecar,
+        libraries,
+    })
+}
+
+fn read_virtual_file(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > limit {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(limit + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= limit).then_some(bytes)
+}
+
+fn set_legacy_host(uc: &mut Unicorn<'_, EmuState>, host: Option<LegacyHostFiles>) {
+    if let Some(host) = host {
+        let state = uc.get_data_mut();
+        state.host_file = host.executable;
+        state.legacy_sidecar = host.sidecar;
+        state.legacy_libraries = host.libraries;
+        state.real_host_file = true;
+    }
+}
+
+fn legacy_virtual_basename(path: &str) -> Option<&str> {
+    // Old CRT path builders can repeat the separator between directory and
+    // basename. Accept only requests for direct children of the virtual root.
+    let mut pieces = path.split(['\\', '/']).filter(|piece| !piece.is_empty());
+    if !pieces.next()?.eq_ignore_ascii_case("C:") || !pieces.next()?.eq_ignore_ascii_case("game") {
+        return None;
+    }
+    let name = pieces.next()?;
+    pieces.next().is_none().then_some(name)
+}
+
+fn legacy_virtual_file<'a>(state: &'a EmuState, path: &str) -> Option<&'a [u8]> {
+    let name = legacy_virtual_basename(path)?;
+    if name.eq_ignore_ascii_case("game.exe") {
+        Some(&state.host_file)
+    } else if name.eq_ignore_ascii_case("module.tpm") {
+        Some(&state.module_file)
+    } else if name.eq_ignore_ascii_case(LEGACY_SIDECAR) {
+        state.legacy_sidecar.as_deref()
+    } else {
+        state
+            .legacy_libraries
+            .iter()
+            .find_map(|(file, bytes)| file.eq_ignore_ascii_case(name).then_some(bytes.as_slice()))
+    }
+}
+
+fn write_legacy_find_data(uc: &mut Unicorn<'_, EmuState>, index: usize, output: u64) -> bool {
+    let Some((name, bytes)) = uc.get_data().legacy_libraries.iter().nth(index) else {
+        return false;
+    };
+    let mut data = [0; 592]; // WIN32_FIND_DATAW
+    data[..4].copy_from_slice(&0x80u32.to_le_bytes()); // FILE_ATTRIBUTE_NORMAL
+    data[32..36].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+    for (field, unit) in data[44..]
+        .chunks_exact_mut(2)
+        .take(259)
+        .zip(name.encode_utf16())
+    {
+        field.copy_from_slice(&unit.to_le_bytes());
+    }
+    uc.mem_write(output, &data).is_ok()
+}
+
 fn build_emulator(pe: &Pe32, trace_code: bool) -> Result<Unicorn<'static, EmuState>> {
     let mut uc = Unicorn::new_with_data(
         Arch::X86,
@@ -2933,12 +3118,21 @@ fn build_emulator(pe: &Pe32, trace_code: bool) -> Result<Unicorn<'static, EmuSta
     // page used by those deterministic setup/teardown instructions.
     uc.mem_map(0, PAGE, Prot::ALL).map_err(uc_error)?;
 
-    // iTVPFunctionExporter is a COM-style interface: QueryFunctions receives
-    // `this,names,functions,count` and removes all four arguments. SetFilter
-    // is likewise stdcall with one argument.
+    write_u32_uc(&mut uc, 0, NO_SEH_FRAME).map_err(uc_error)?;
+    // Both exporter ABIs receive four stack arguments. Older cdecl plugins
+    // release those arguments in the caller.
     uc.mem_write(RETURN_SENTINEL, &[0xcc]).map_err(uc_error)?;
     uc.mem_write(QUERY_STUB, &[0xc2, 0x10, 0x00])
         .map_err(uc_error)?;
+    uc.mem_write(QUERY_CDECL_RETURN, &[0xc3])
+        .map_err(uc_error)?;
+    uc.mem_write(SEH_RETURN, &[0xcc]).map_err(uc_error)?;
+    uc.add_code_hook(SEH_RETURN, SEH_RETURN, |uc, _, _| {
+        if !finish_guest_exception(uc) {
+            unsupported_guest_call(uc, "SEH handler did not handle the exception");
+        }
+    })
+    .map_err(uc_error)?;
     uc.mem_write(SET_FILTER_STUB, &[0xc2, 0x04, 0x00])
         .map_err(uc_error)?;
     uc.mem_write(THROW_STUB, &[0xc2, 0x04, 0x00])
@@ -2991,7 +3185,10 @@ fn build_emulator(pe: &Pe32, trace_code: bool) -> Result<Unicorn<'static, EmuSta
                 ok = false;
             }
         }
-        let _ = uc.reg_write(RegisterX86::EAX, if ok { 1 } else { 0 });
+        let _ = uc.reg_write(RegisterX86::EAX, u64::from(ok));
+        if query_caller_cleans_stack(uc, esp) {
+            let _ = uc.reg_write(RegisterX86::EIP, QUERY_CDECL_RETURN);
+        }
     })
     .map_err(uc_error)?;
 
@@ -3084,7 +3281,15 @@ fn run_v2link_capture(uc: &mut Unicorn<'static, EmuState>, v2link_va: u32) -> Re
     // for the former and required by the latter (including the Fate sample).
     uc.reg_write(RegisterX86::EAX, EXPORTER_OBJ)
         .map_err(uc_error)?;
-    uc.emu_start(v2link_va as u64, RETURN_SENTINEL, TIMEOUT_US, MAX_STEPS)
+    // Some plugins process the whole host file after registering the
+    // callback. Use a watchdog without Unicorn's per-instruction count hook
+    // for this file-sized work, and require a normal return below.
+    let (timeout, steps) = if uc.get_data().real_host_file {
+        (LEGACY_HOST_TIMEOUT_US, 0)
+    } else {
+        (TIMEOUT_US, MAX_STEPS)
+    };
+    uc.emu_start(v2link_va as u64, RETURN_SENTINEL, timeout, steps)
         .map_err(|e| {
             let eip = uc.reg_read(RegisterX86::EIP).unwrap_or(0);
             let esp = uc.reg_read(RegisterX86::ESP).unwrap_or(0);
@@ -3109,6 +3314,11 @@ fn run_v2link_capture(uc: &mut Unicorn<'static, EmuState>, v2link_va: u32) -> Re
             uc.get_data().file_trace
         )));
     }
+    if uc.reg_read(RegisterX86::EIP).map_err(uc_error)? != RETURN_SENTINEL {
+        return Err(Error::unsupported(
+            "V2Link exhausted its emulation budget before returning",
+        ));
+    }
     uc.get_data().captured_callback.ok_or_else(|| {
         Error::format("V2Link returned without registering an XP3 extraction filter")
     })
@@ -3127,7 +3337,7 @@ fn run_initialized_v2link_capture(
             .bytes
             .windows(b"RELEASE_SIG____".len())
             .any(|window| window == b"RELEASE_SIG____");
-    if has_external_host_auth_markers {
+    if has_external_host_auth_markers && !uc.get_data().real_host_file {
         let (auth_helper_va, branch_va, success_va) =
             find_external_host_auth_success_branch(pe, v2link_va)
             .ok_or_else(|| {
@@ -3417,6 +3627,132 @@ fn install_one_api_stub(
     Ok(stub as u32)
 }
 
+fn query_caller_cleans_stack(uc: &Unicorn<'_, EmuState>, stack: u64) -> bool {
+    let Some(caller) = read_u32_uc(uc, stack).ok().map(u64::from) else {
+        return false;
+    };
+    uc.mem_read_as_vec(caller, 3).ok().as_deref() == Some(&[0x83, 0xc4, 0x10])
+        || uc.mem_read_as_vec(caller, 6).ok().as_deref() == Some(&[0x81, 0xc4, 0x10, 0, 0, 0])
+}
+
+fn access_debug_registers(
+    uc: &mut Unicorn<'_, EmuState>,
+    context: u64,
+    write_registers: bool,
+) -> std::result::Result<(), unicorn_engine::uc_error> {
+    let mut values = uc.get_data().debug_registers;
+    for (i, value) in values.iter_mut().enumerate() {
+        let field = context + 4 + i as u64 * 4;
+        if write_registers {
+            *value = read_u32_uc(uc, field)?;
+        } else {
+            write_u32_uc(uc, field, *value)?;
+        }
+    }
+    if write_registers {
+        uc.get_data_mut().debug_registers = values;
+    }
+    Ok(())
+}
+
+const SEH_REGISTERS: [(RegisterX86, u64); 10] = [
+    (RegisterX86::EDI, 156),
+    (RegisterX86::ESI, 160),
+    (RegisterX86::EBX, 164),
+    (RegisterX86::EDX, 168),
+    (RegisterX86::ECX, 172),
+    (RegisterX86::EAX, 176),
+    (RegisterX86::EBP, 180),
+    (RegisterX86::EIP, 184),
+    (RegisterX86::EFLAGS, 192),
+    (RegisterX86::ESP, 196),
+];
+
+fn dispatch_guest_exception(
+    uc: &mut Unicorn<'_, EmuState>,
+    esp: u64,
+    code: u32,
+    flags: u32,
+    count: u32,
+    args: u32,
+) -> bool {
+    let mut dispatch = || -> Option<()> {
+        if count > 15 || flags & !1 != 0 || uc.get_data().exception.is_some() {
+            return None;
+        }
+        let frame = read_u32_uc(uc, 0).ok()?;
+        if !(STACK_BASE..STACK_BASE + STACK_SIZE - 8).contains(&u64::from(frame)) {
+            return None;
+        }
+        let handler = read_u32_uc(uc, u64::from(frame) + 4).ok()?;
+        let base = uc.get_data().module_image_base;
+        if handler < base || handler - base >= uc.get_data().module_image_size {
+            return None;
+        }
+        let continuation = read_u32_uc(uc, esp).ok()?;
+        for (i, value) in [code, flags, 0, continuation, count]
+            .into_iter()
+            .enumerate()
+        {
+            write_u32_uc(uc, SEH_RECORD + i as u64 * 4, value).ok()?;
+        }
+        for i in 0..count as u64 {
+            let value = read_u32_uc(uc, u64::from(args) + i * 4).ok()?;
+            write_u32_uc(uc, SEH_RECORD + 20 + i * 4, value).ok()?;
+        }
+        write_u32_uc(uc, SEH_CONTEXT, CONTEXT_INTEGER_CONTROL).ok()?;
+        for (reg, field) in SEH_REGISTERS {
+            let value = match reg {
+                RegisterX86::EIP => continuation,
+                RegisterX86::ESP => (esp + 20) as u32,
+                _ => uc.reg_read(reg).ok()? as u32,
+            };
+            write_u32_uc(uc, SEH_CONTEXT + field, value).ok()?;
+        }
+        write_u32_uc(uc, SEH_DISPATCHER, 0).ok()?;
+        let stack = esp.checked_sub(20)?;
+        for (i, value) in [
+            SEH_RETURN as u32,
+            SEH_RECORD as u32,
+            frame,
+            SEH_CONTEXT as u32,
+            SEH_DISPATCHER as u32,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            write_u32_uc(uc, stack + i as u64 * 4, value).ok()?;
+        }
+        uc.get_data_mut().exception = Some(GuestException {
+            frame,
+            continuable: flags == 0,
+        });
+        uc.reg_write(RegisterX86::ESP, stack).ok()?;
+        uc.reg_write(RegisterX86::EIP, u64::from(handler)).ok()?;
+        Some(())
+    };
+    dispatch().is_some()
+}
+
+fn finish_guest_exception(uc: &mut Unicorn<'_, EmuState>) -> bool {
+    let Some(exception) = uc.get_data_mut().exception.take() else {
+        return false;
+    };
+    exception.continuable
+        && uc.reg_read(RegisterX86::EAX).ok() == Some(0)
+        && SEH_REGISTERS.into_iter().all(|(reg, offset)| {
+            read_u32_uc(uc, SEH_CONTEXT + offset)
+                .ok()
+                .is_some_and(|value| uc.reg_write(reg, u64::from(value)).is_ok())
+        })
+}
+
+fn unsupported_guest_call(uc: &mut Unicorn<'_, EmuState>, message: &str) {
+    uc.get_data_mut().unsupported_api = Some(message.to_owned());
+    let _ = uc.reg_write(RegisterX86::EAX, 0);
+    let _ = uc.emu_stop();
+}
+
 fn emulate_kernel_api(uc: &mut Unicorn<'_, EmuState>, api: &Win32Api, name: &str) {
     uc.get_data_mut().last_api = Some(name.to_string());
     let esp = match uc.reg_read(RegisterX86::ESP) {
@@ -3591,17 +3927,22 @@ fn emulate_kernel_api(uc: &mut Unicorn<'_, EmuState>, api: &Win32Api, name: &str
             let output = arg(uc, 1) as u64;
             let capacity = arg(uc, 2) as usize;
             let wide = matches!(api, Win32Api::GetModuleFileNameW);
-            let path = if (HOST_BASE..HOST_BASE + HOST_SIZE).contains(&module) {
-                "C:\\game\\game.exe\0"
+            let path = if (module == 0 && uc.get_data().real_host_file)
+                || (HOST_BASE..HOST_BASE + HOST_SIZE).contains(&module)
+            {
+                EXE_HOST_PATH
             } else {
-                "C:\\game\\module.tpm\0"
+                MODULE_HOST_PATH
             };
             let bytes = if wide {
                 path.encode_utf16()
+                    .chain(std::iter::once(0))
                     .flat_map(u16::to_le_bytes)
                     .collect::<Vec<_>>()
             } else {
-                path.as_bytes().to_vec()
+                let mut ansi = path.as_bytes().to_vec();
+                ansi.push(0);
+                ansi
             };
             let unit = if wide { 2 } else { 1 };
             let writable = capacity.saturating_mul(unit).min(bytes.len());
@@ -3881,14 +4222,37 @@ fn emulate_win32_compat_api(uc: &mut Unicorn<'_, EmuState>, name: &str, esp: u64
             set_eax(uc, value as u32 as u64);
         }
         "FindFirstFileW" => {
-            uc.get_data_mut().win32.set_last_error(2);
-            set_eax(uc, 0xffff_ffff);
+            let pattern = read_utf16_string_uc(uc, u64::from(arg(uc, 0)), 260);
+            if matches!(
+                pattern.as_deref().and_then(legacy_virtual_basename),
+                Some("*" | "*.*")
+            ) && write_legacy_find_data(uc, 0, u64::from(arg(uc, 1)))
+            {
+                uc.get_data_mut().legacy_find_index = Some(1);
+                set_eax(uc, u64::from(LEGACY_FIND_HANDLE));
+            } else {
+                uc.get_data_mut().win32.set_last_error(2);
+                set_eax(uc, u64::from(u32::MAX));
+            }
         }
         "FindNextFileW" => {
-            uc.get_data_mut().win32.set_last_error(18);
-            set_eax(uc, 0);
+            let index = uc.get_data().legacy_find_index;
+            let found = arg(uc, 0) == LEGACY_FIND_HANDLE
+                && index
+                    .is_some_and(|index| write_legacy_find_data(uc, index, u64::from(arg(uc, 1))));
+            if found {
+                uc.get_data_mut().legacy_find_index = index.map(|index| index + 1);
+            } else {
+                uc.get_data_mut().win32.set_last_error(18);
+            }
+            set_eax(uc, u64::from(found));
         }
-        "FindClose" => set_eax(uc, 1),
+        "FindClose" => {
+            if arg(uc, 0) == LEGACY_FIND_HANDLE {
+                uc.get_data_mut().legacy_find_index = None;
+            }
+            set_eax(uc, 1);
+        }
         "GetStdHandle" => set_eax(uc, 0xffff_ffff),
         "GetFileType" => set_eax(uc, 1),
         "SetUnhandledExceptionFilter" => set_eax(uc, 0),
@@ -4033,14 +4397,21 @@ fn emulate_win32_compat_api(uc: &mut Unicorn<'_, EmuState>, name: &str, esp: u64
         }
         "HeapValidate" | "HeapSetInformation" | "HeapLock" | "HeapUnlock" => set_eax(uc, 1),
         "GetCurrentThread" => set_eax(uc, 0xffff_fffe),
+        "GetThreadContext" | "SetThreadContext" => {
+            let context = arg(uc, 1) as u64;
+            let ok = arg(uc, 0) == 0xffff_fffe
+                && read_u32_uc(uc, context).ok() == Some(CONTEXT_DEBUG_REGISTERS)
+                && access_debug_registers(uc, context, name == "SetThreadContext").is_ok();
+            if !ok {
+                uc.get_data_mut()
+                    .win32
+                    .set_last_error(ERROR_INVALID_PARAMETER);
+            }
+            set_eax(uc, u64::from(ok));
+        }
         "SwitchToThread" => set_eax(uc, 0),
         "GetEnvironmentVariableW" => set_eax(uc, 0),
         "GetFileAttributesA" | "GetFileAttributesW" => {
-            uc.get_data_mut().win32.set_last_error(2);
-            set_eax(uc, 0xffff_ffff);
-        }
-        // File and console I/O is never available to the guest.
-        "CreateFileW" => {
             uc.get_data_mut().win32.set_last_error(2);
             set_eax(uc, 0xffff_ffff);
         }
@@ -4200,22 +4571,44 @@ fn emulate_win32_compat_api(uc: &mut Unicorn<'_, EmuState>, name: &str, esp: u64
                 && ((0x81..=0x9f).contains(&byte) || (0xe0..=0xfc).contains(&byte));
             set_eax(uc, u64::from(lead));
         }
-        "CreateFileA" => {
-            let path =
-                read_c_string_uc(uc, arg(uc, 0) as u64, 4096).unwrap_or_else(|| "<invalid>".into());
+        "CreateFileA" | "CreateFileW" => {
+            let ptr = arg(uc, 0) as u64;
+            let path = if name == "CreateFileW" {
+                read_utf16_string_uc(uc, ptr, 4096)
+            } else {
+                read_c_string_uc(uc, ptr, 4096)
+            };
+            let Some(path) = path else {
+                uc.get_data_mut()
+                    .win32
+                    .set_last_error(ERROR_INVALID_PARAMETER);
+                set_eax(uc, u64::from(u32::MAX));
+                return true;
+            };
             let caller = read_u32_uc(uc, esp).unwrap_or(0);
             let access = arg(uc, 1);
             let creation = arg(uc, 4);
             let state = uc.get_data_mut();
+            const OPEN_EXISTING: u32 = 3;
+            const WRITE_ACCESS: u32 = 0x5001_0116;
+            let bytes = if state.real_host_file || name == "CreateFileW" {
+                legacy_virtual_file(state, &path)
+                    .filter(|_| access & WRITE_ACCESS == 0 && creation == OPEN_EXISTING)
+            } else if path.to_ascii_lowercase().ends_with("game.exe") {
+                Some(state.host_file.as_slice())
+            } else {
+                Some(state.module_file.as_slice())
+            };
+            let Some(bytes) = bytes else {
+                state.win32.set_last_error(2);
+                set_eax(uc, u64::from(u32::MAX));
+                return true;
+            };
+            state.opened_file = bytes.to_vec();
             state.file_cursor = 0;
             state.file_open = true;
-            state.opened_file = if path.to_ascii_lowercase().ends_with("game.exe") {
-                state.host_file.clone()
-            } else {
-                state.module_file.clone()
-            };
             state.file_trace.push(format!(
-                "CreateFileA(caller=0x{caller:08x}, path={path:?}, access=0x{access:08x}, creation={creation})"
+                "{name}(caller=0x{caller:08x}, path={path:?}, access=0x{access:08x}, creation={creation})"
             ));
             set_eax(uc, 0x4444);
         }
@@ -4458,12 +4851,34 @@ fn emulate_win32_compat_api(uc: &mut Unicorn<'_, EmuState>, name: &str, esp: u64
             set_eax(uc, u64::from(ok));
         }
         "LCMapStringA" | "LCMapStringW" => set_eax(uc, 0),
-        "RtlUnwind" | "RaiseException" | "ExitProcess" | "TerminateProcess" => {
-            uc.get_data_mut().unsupported_api = Some(format!(
-                "{name} was reached during deterministic module initialization"
-            ));
-            set_eax(uc, 0);
-            let _ = uc.emu_stop();
+        "RaiseException" => {
+            let (code, flags, count, args) = (arg(uc, 0), arg(uc, 1), arg(uc, 2), arg(uc, 3));
+            if !dispatch_guest_exception(uc, esp, code, flags, count, args) {
+                unsupported_guest_call(uc, "RaiseException requires unsupported guest SEH");
+            }
+        }
+        "RtlUnwind" => {
+            let target = arg(uc, 0);
+            let continuation = arg(uc, 1);
+            let pending = uc
+                .get_data()
+                .exception
+                .as_ref()
+                .map(|exception| exception.frame);
+            // The guest CRT owns local unwind cleanup. This subset only
+            // accepts an unwind back to the current registration frame.
+            if pending == Some(target)
+                && read_u32_uc(uc, 0).ok() == Some(target)
+                && read_u32_uc(uc, esp).ok() == Some(continuation)
+            {
+                uc.get_data_mut().exception = None;
+                set_eax(uc, u64::from(arg(uc, 3)));
+            } else {
+                unsupported_guest_call(uc, "RtlUnwind requires unsupported guest SEH");
+            }
+        }
+        "ExitProcess" | "TerminateProcess" => {
+            unsupported_guest_call(uc, &format!("{name} was reached during guest execution"));
         }
         _ => return false,
     }
@@ -4495,6 +4910,7 @@ pub fn probe_x86_filter_module(
     if options.dynamic_v2link {
         if let Some(v2) = v2link_va {
             match build_emulator(&pe, options.trace_code).and_then(|mut uc| {
+                set_legacy_host(&mut uc, read_legacy_host(path));
                 run_dll_process_attach(&mut uc, &pe)?;
                 let callback = run_initialized_v2link_capture(&mut uc, &pe, v2)?;
                 let requested = uc.get_data().requested_exports.clone();
@@ -4635,6 +5051,257 @@ fn collect_pe_like_files(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn call_guest_api(
+        uc: &mut Unicorn<'static, EmuState>,
+        next_stub: &mut u64,
+        name: &str,
+        args: &[u32],
+    ) -> u32 {
+        let address = install_one_api_stub(uc, name, Win32Api::from_name(name), next_stub).unwrap();
+        reset_stack_for_call(uc, args).unwrap();
+        uc.emu_start(u64::from(address), RETURN_SENTINEL, 0, 10_000)
+            .unwrap();
+        uc.reg_read(RegisterX86::EAX).unwrap() as u32
+    }
+
+    #[test]
+    fn legacy_exporter_preserves_stack_for_both_abis() {
+        let pe = synthetic_registration_pe();
+        let routine = u64::from(pe.image_base + pe.entry_point_rva);
+        let mut uc = build_emulator(&pe, false).unwrap();
+        let name = HOST_BASE + 0x5000;
+        let names = name + 0x100;
+        let output = names + 4;
+        uc.mem_write(name, b"TVPSetXP3ArchiveExtractionFilter\0")
+            .unwrap();
+        write_u32_uc(&mut uc, names, name as u32).unwrap();
+
+        for cdecl in [false, true] {
+            let mut code = Vec::new();
+            for arg in [1, output as u32, names as u32, EXPORTER_OBJ as u32] {
+                code.push(0x68); // push imm32
+                code.extend_from_slice(&arg.to_le_bytes());
+            }
+            code.push(0xb8); // mov eax, QueryFunctions
+            code.extend_from_slice(&(QUERY_STUB as u32).to_le_bytes());
+            code.extend_from_slice(&[0xff, 0xd0]); // call eax
+            if cdecl {
+                code.extend_from_slice(&[0x83, 0xc4, 0x10]); // add esp, 16
+            }
+            code.push(0xc3); // ret
+            uc.mem_write(routine, &code).unwrap();
+            uc.ctl_remove_cache(routine, routine + 0x100).unwrap();
+            reset_stack_for_call(&mut uc, &[]).unwrap();
+            let stack = uc.reg_read(RegisterX86::ESP).unwrap();
+            uc.emu_start(routine, RETURN_SENTINEL, 0, 10_000).unwrap();
+            assert_eq!(uc.reg_read(RegisterX86::EIP).unwrap(), RETURN_SENTINEL);
+            assert_eq!(uc.reg_read(RegisterX86::ESP).unwrap(), stack + 4);
+            assert_eq!(uc.reg_read(RegisterX86::EAX).unwrap(), 1);
+            assert_eq!(read_u32_uc(&uc, output).unwrap(), SET_FILTER_STUB as u32);
+        }
+    }
+
+    #[test]
+    fn legacy_thread_context_is_guest_local() {
+        let pe = synthetic_registration_pe();
+        let mut uc = build_emulator(&pe, false).unwrap();
+        let mut next_stub = API_STUB_BASE;
+        let input = HOST_BASE + 0x5000;
+        let output = input + 0x100;
+        let registers = [1, 2, 3, 4, 0x40, 0x400];
+        for addr in [input, output] {
+            write_u32_uc(&mut uc, addr, CONTEXT_DEBUG_REGISTERS).unwrap();
+        }
+        for (i, value) in registers.into_iter().enumerate() {
+            write_u32_uc(&mut uc, input + 4 + i as u64 * 4, value).unwrap();
+        }
+        let thread = call_guest_api(&mut uc, &mut next_stub, "GetCurrentThread", &[]);
+        assert_eq!(
+            call_guest_api(
+                &mut uc,
+                &mut next_stub,
+                "SetThreadContext",
+                &[thread, input as u32]
+            ),
+            1
+        );
+        assert_eq!(
+            call_guest_api(
+                &mut uc,
+                &mut next_stub,
+                "GetThreadContext",
+                &[thread, output as u32]
+            ),
+            1
+        );
+        assert_eq!(
+            call_guest_api(
+                &mut uc,
+                &mut next_stub,
+                "GetThreadContext",
+                &[1, output as u32]
+            ),
+            0
+        );
+        for (i, value) in registers.into_iter().enumerate() {
+            assert_eq!(read_u32_uc(&uc, output + 4 + i as u64 * 4).unwrap(), value);
+        }
+        assert_eq!(
+            build_emulator(&pe, false)
+                .unwrap()
+                .get_data()
+                .debug_registers,
+            [0; 6]
+        );
+    }
+
+    #[test]
+    fn legacy_guest_exception_dispatches_to_registered_handler() {
+        let pe = synthetic_registration_pe();
+        let mut uc = build_emulator(&pe, false).unwrap();
+        let mut next_stub = API_STUB_BASE;
+        let handler = u64::from(pe.image_base + pe.entry_point_rva);
+        uc.mem_write(
+            handler,
+            &[
+                0x8b, 0x44, 0x24, 0x04, // mov eax, [esp+4] (exception record)
+                0x8b, 0x00, // mov eax, [eax] (exception code)
+                0x8b, 0x54, 0x24, 0x0c, // mov edx, [esp+12] (context)
+                0x89, 0x82, 0xb0, 0, 0, 0, // mov [edx+176], eax (saved eax)
+                0x31, 0xc0, 0xc3, // xor eax, eax; ret (continue execution)
+            ],
+        )
+        .unwrap();
+        let frame = STACK_BASE + STACK_SIZE - 0x100;
+        write_u32_uc(&mut uc, 0, frame as u32).unwrap();
+        write_u32_uc(&mut uc, frame, NO_SEH_FRAME).unwrap();
+        write_u32_uc(&mut uc, frame + 4, handler as u32).unwrap();
+        let code = 0xe001_0001;
+        assert_eq!(
+            call_guest_api(&mut uc, &mut next_stub, "RaiseException", &[code, 0, 0, 0]),
+            code
+        );
+        assert_eq!(uc.reg_read(RegisterX86::EIP).unwrap(), RETURN_SENTINEL);
+        assert!(uc.get_data().exception.is_none());
+        write_u32_uc(&mut uc, 0, NO_SEH_FRAME).unwrap();
+        assert_eq!(
+            call_guest_api(&mut uc, &mut next_stub, "RaiseException", &[code, 0, 0, 0]),
+            0
+        );
+        assert!(uc.get_data().unsupported_api.is_some());
+    }
+
+    #[test]
+    fn legacy_host_file_is_virtual_and_read_only() {
+        let pe = synthetic_registration_pe();
+        let mut uc = build_emulator(&pe, false).unwrap();
+        let mut next_stub = API_STUB_BASE;
+        let path = HOST_BASE + 0x5000;
+        let output = path + 0x80;
+        let payload = b"MZ virtual host bytes";
+        set_legacy_host(
+            &mut uc,
+            Some(LegacyHostFiles {
+                executable: payload.to_vec(),
+                sidecar: Some(b"fixture".to_vec()),
+                libraries: BTreeMap::from([("sample.tpm".into(), b"module".to_vec())]),
+            }),
+        );
+        assert_eq!(
+            legacy_virtual_file(uc.get_data(), r"C:\game\\sigdata.t01"),
+            Some(b"fixture".as_slice()),
+        );
+
+        assert_eq!(
+            call_guest_api(
+                &mut uc,
+                &mut next_stub,
+                "GetModuleFileNameW",
+                &[0, path as u32, 64]
+            ),
+            EXE_HOST_PATH.len() as u32
+        );
+        assert_eq!(
+            read_utf16_string_uc(&uc, path, 64).as_deref(),
+            Some(EXE_HOST_PATH)
+        );
+
+        let mut open_args = [path as u32, 0x8000_0000, 1, 0, 3, 0, 0];
+        let handle = call_guest_api(&mut uc, &mut next_stub, "CreateFileW", &open_args);
+        assert_ne!(handle, u32::MAX);
+        assert_eq!(
+            call_guest_api(
+                &mut uc,
+                &mut next_stub,
+                "ReadFile",
+                &[handle, output as u32, payload.len() as u32, 0, 0]
+            ),
+            1
+        );
+        assert_eq!(uc.mem_read_as_vec(output, payload.len()).unwrap(), payload);
+        open_args[1] = 0x4000_0000;
+        assert_eq!(
+            call_guest_api(&mut uc, &mut next_stub, "CreateFileW", &open_args),
+            u32::MAX
+        );
+        let pattern: Vec<u8> = r"C:\game\*.*"
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        uc.mem_write(path, &pattern).unwrap();
+        let listing = call_guest_api(
+            &mut uc,
+            &mut next_stub,
+            "FindFirstFileW",
+            &[path as u32, output as u32],
+        );
+        assert_ne!(listing, u32::MAX);
+        assert_eq!(
+            read_utf16_string_uc(&uc, output + 44, 260).as_deref(),
+            Some("sample.tpm")
+        );
+        assert_eq!(
+            call_guest_api(&mut uc, &mut next_stub, "FindNextFileW", &[listing, output as u32]),
+            0
+        );
+        assert_eq!(call_guest_api(&mut uc, &mut next_stub, "FindClose", &[listing]), 1);
+        open_args[1] = 0x8000_0000;
+        uc.mem_write(path, &[b'X', 0]).unwrap();
+        assert_eq!(
+            call_guest_api(&mut uc, &mut next_stub, "CreateFileW", &open_args),
+            u32::MAX
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a local XP3 and its companion legacy TPM and game EXE"]
+    fn legacy_tpm_recovers_a_real_tlg() {
+        use crate::xp3::Archive;
+
+        let archive = std::env::var_os("XP3_TEST_LEGACY_ARCHIVE").expect("XP3_TEST_LEGACY_ARCHIVE");
+        let module = std::env::var_os("XP3_TEST_LEGACY_TPM").expect("XP3_TEST_LEGACY_TPM");
+        let archive = Archive::open(archive).unwrap();
+        let (index, entry) = archive
+            .entries
+            .iter()
+            .enumerate()
+            .find(|(_, entry)| entry.preferred_name().ends_with(".tlg") && entry.adler.is_some())
+            .unwrap();
+        let mut data = archive.reconstruct_entry_segments(index).unwrap();
+        assert_eq!(archive.adler_matches(index, &data).unwrap(), Some(false));
+        let mut runtime = X86Xp3FilterRuntime::open(module, false).unwrap();
+        assert_eq!(runtime.callback_source(), "v2link-emulated-registration");
+        runtime.apply(0, entry.adler.unwrap(), &mut data).unwrap();
+        assert_eq!(
+            archive.adler_matches(index, &data).unwrap(),
+            Some(true),
+            "fixture {} failed the archive checksum",
+            entry.preferred_name()
+        );
+        assert!(data.starts_with(b"TLG"));
+    }
 
     #[test]
     fn page_alignment() {

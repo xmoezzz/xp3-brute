@@ -529,6 +529,7 @@ fn unknown_stack_bytes(name: &str) -> u16 {
         | "GetUserDefaultLCID"
         | "GetSystemDefaultLCID"
         | "GetThreadLocale" => 0,
+        "GetThreadContext" | "SetThreadContext" => 8,
         "InterlockedDecrement"
         | "InterlockedIncrement"
         | "CloseHandle"
