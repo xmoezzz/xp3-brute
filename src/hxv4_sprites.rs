@@ -543,6 +543,10 @@ fn read_definitions(
             format!("{role}.stand"),
             format!("face{role}.stand"),
         ];
+        if let Some(role) = numbered_pose_role(model) {
+            candidates.push(format!("{role}.stand"));
+            candidates.push(format!("face{role}.stand"));
+        }
         let ending = format!("_{model}.sinfo");
         for alias in &aliases {
             if let Some(prefix) = alias.strip_suffix(&ending) {
@@ -591,6 +595,18 @@ fn character_stand_aliases(source: &str) -> impl Iterator<Item = &str> {
             && name.ends_with(".stand"))
         .then_some(name)
     })
+}
+
+// Some stand definitions append the pose number directly to the role name,
+// followed by a separate numeric variant, as in `花12_1`.
+fn numbered_pose_role(model: &str) -> Option<&str> {
+    let (pose, variant) = model.rsplit_once('_')?;
+    let role = pose.trim_end_matches(|ch: char| ch.is_ascii_digit());
+    (!role.is_empty()
+        && role.len() < pose.len()
+        && !variant.is_empty()
+        && variant.bytes().all(|ch| ch.is_ascii_digit()))
+    .then_some(role)
 }
 
 fn sinfo_stem(text: &str) -> Option<&str> {
@@ -699,6 +715,25 @@ mod tests {
         }
         assert!(index.entries[8..].iter().all(|entry| entry.name.is_none()));
         assert!(read_asset(&[0x82]).is_none());
+    }
+
+    #[test]
+    fn recovers_stand_name_from_numbered_pose_and_variant() {
+        let group = [1; 8];
+        let stand_name = "花_苗.stand";
+        let targets = HashMap::from([((group, hxv4_filename_hash(stand_name)), Some(3))]);
+        let mut names = HashMap::new();
+        let source = r#"[%["filename"=>"花_苗12_1"], %["filename"=>"花_苗3_2"]]"#;
+
+        let (models, _) = read_definitions(&mut names, &targets, group, 2, source);
+        assert_eq!(models, ["花_苗12_1", "花_苗3_2"]);
+        assert!(names.is_empty());
+
+        read_definitions(&mut names, &targets, group, 3, source);
+        assert_eq!(names.get(&3).map(String::as_str), Some(stand_name));
+        assert_eq!(numbered_pose_role("花_苗12_"), None);
+        assert_eq!(numbered_pose_role("花_苗12_casual"), None);
+        assert_eq!(numbered_pose_role("12_1"), None);
     }
 
     #[test]
