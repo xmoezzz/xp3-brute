@@ -163,7 +163,9 @@ The profile has two fields.
   content filter. A relative path is resolved against the profile's directory.
 
 The CLI checks the name table against the archive's filename tokens and
-Adler-32 values. Before extracting, it verifies the supplied content profile
+Adler-32 values. Archives can also contain directly named files alongside
+those tokens. The CLI verifies their plaintext Adler-32 and preserves their
+literal paths. Before extracting, it verifies the supplied content profile
 against the protected entries. Keep application-specific profile data local.
 
 ### MadoCrypt archives and Yakimochi filenames

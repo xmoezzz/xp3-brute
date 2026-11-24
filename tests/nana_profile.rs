@@ -50,12 +50,11 @@ fn chunk(tag: &[u8; 4], body: &[u8]) -> Vec<u8> {
 }
 
 fn file_chunk(name: &str, checksum: u32, data_offset: usize, size: usize) -> Vec<u8> {
-    let token = cxdec_filename_md5_token("dls:", name);
     let mut info = 0x8000_0000u32.to_le_bytes().to_vec();
     info.extend((size as u64).to_le_bytes());
     info.extend((size as u64).to_le_bytes());
-    info.extend((token.encode_utf16().count() as u16).to_le_bytes());
-    info.extend(token.encode_utf16().flat_map(u16::to_le_bytes));
+    info.extend((name.encode_utf16().count() as u16).to_le_bytes());
+    info.extend(name.encode_utf16().flat_map(u16::to_le_bytes));
     let mut segment = 0u32.to_le_bytes().to_vec();
     segment.extend((data_offset as u64).to_le_bytes());
     segment.extend((size as u64).to_le_bytes());
@@ -66,7 +65,12 @@ fn file_chunk(name: &str, checksum: u32, data_offset: usize, size: usize) -> Vec
     chunk(b"File", &body)
 }
 
-fn make_fixture(directory: &TestDirectory, bad_adler: bool, trailing_data: bool) {
+fn make_fixture(
+    directory: &TestDirectory,
+    bad_adler: bool,
+    trailing_data: bool,
+    direct_files: &[(&str, &[u8], u32)],
+) {
     let content = CxdecProfile {
         mask: 0x0f,
         offset: 7,
@@ -88,7 +92,8 @@ fn make_fixture(directory: &TestDirectory, bad_adler: bool, trailing_data: bool)
         let checksum = adler32(plain);
         let mut content = plain.to_vec();
         engine.apply(0, checksum, &mut content).unwrap();
-        file_records.extend(file_chunk(name, checksum, archive.len(), content.len()));
+        let token = cxdec_filename_md5_token("dls:", name);
+        file_records.extend(file_chunk(&token, checksum, archive.len(), content.len()));
         archive.extend(content);
 
         let name_checksum = if bad_adler && number == 0 {
@@ -103,6 +108,10 @@ fn make_fixture(directory: &TestDirectory, bad_adler: bool, trailing_data: bool)
         let mut reversed = chunk(b"hnfn", &record);
         reversed.extend(name_records);
         name_records = reversed;
+    }
+    for &(name, plain, checksum) in direct_files {
+        file_records.extend(file_chunk(name, checksum, archive.len(), plain.len()));
+        archive.extend(plain);
     }
     let mut compressed = ZlibEncoder::new(Vec::new(), Compression::default());
     compressed.write_all(&name_records).unwrap();
@@ -158,7 +167,7 @@ fn unpack(directory: &TestDirectory, profile: &Path, output: &Path) -> Output {
 #[test]
 fn nana_profile_unpacks_files_under_verified_original_names() {
     let directory = TestDirectory::new();
-    make_fixture(&directory, false, false);
+    make_fixture(&directory, false, false, &[]);
     let profile = write_profile(&directory, KEY, 217);
     let output_path = directory.join("extracted");
     let result = unpack(&directory, &profile, &output_path);
@@ -185,6 +194,60 @@ fn nana_profile_unpacks_files_under_verified_original_names() {
 }
 
 #[test]
+fn nana_profile_keeps_both_direct_startup_entries() {
+    let directory = TestDirectory::new();
+    let bootstrap = b"bootstrap script";
+    let literal = b"other startup script";
+    let direct_files = [
+        ("$", bootstrap.as_slice(), adler32(bootstrap)),
+        ("startup.tjs", literal.as_slice(), adler32(literal)),
+    ];
+    make_fixture(&directory, false, false, &direct_files);
+    let profile = write_profile(&directory, KEY, 217);
+    let output = directory.join("extracted");
+    let result = unpack(&directory, &profile, &output);
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for (name, data) in FILES {
+        assert_eq!(fs::read(output.join(name)).unwrap(), data);
+    }
+    for (name, data, _) in direct_files {
+        assert_eq!(fs::read(output.join(name)).unwrap(), data);
+    }
+}
+
+#[test]
+fn nana_profile_rejects_unverified_mixed_entries_before_output() {
+    let plain = b"direct content";
+    let checksum = adler32(plain);
+    let cases = [
+        (
+            "0123456789abcdef0123456789abcdef",
+            checksum,
+            "no filename token",
+        ),
+        ("startup.tjs", checksum ^ 1, "direct File"),
+        ("SCENARIO\\SECOND.BIN", checksum, "duplicate output path"),
+        ("scenario", checksum, "conflicting output path"),
+        ("../outside", checksum, "invalid direct filename"),
+    ];
+    for (name, checksum, cause) in cases {
+        let directory = TestDirectory::new();
+        make_fixture(&directory, false, false, &[(name, plain, checksum)]);
+        let profile = write_profile(&directory, KEY, 217);
+        let output = directory.join("extracted");
+        let result = unpack(&directory, &profile, &output);
+        let stderr = String::from_utf8_lossy(&result.stderr);
+        assert!(!result.status.success(), "unexpected success for {cause}");
+        assert!(stderr.contains(cause), "expected {cause}: {stderr}");
+        assert!(!output.exists());
+    }
+}
+
+#[test]
 fn nana_profile_rejects_invalid_names_or_content_before_output() {
     let cases = [
         (false, false, [0; 6], 217, "zlib"),
@@ -194,7 +257,7 @@ fn nana_profile_rejects_invalid_names_or_content_before_output() {
     ];
     for (bad_adler, trailing_data, key, seed, cause) in cases {
         let directory = TestDirectory::new();
-        make_fixture(&directory, bad_adler, trailing_data);
+        make_fixture(&directory, bad_adler, trailing_data, &[]);
         let profile = write_profile(&directory, key, seed);
         let output_path = directory.join("extracted");
         let result = unpack(&directory, &profile, &output_path);
