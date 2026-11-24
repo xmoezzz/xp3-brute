@@ -2,7 +2,15 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use std::hash::Hasher;
+use std::io::Read;
+
 use serde::Deserialize;
+use sha3::{
+    digest::{ExtendableOutput, Update, XofReader},
+    Shake256,
+};
+use siphasher::sip::SipHasher24;
 use xp3_brute::{
     cxdec_filename_md5_token, Archive, CxdecEngine, CxdecGeneratorKind, CxdecNameProfile,
     CxdecProfile, OrderedNameRecovery, RootKind, YuzKey,
@@ -11,7 +19,33 @@ use xp3_brute::{
 #[derive(Clone)]
 pub(super) struct NanaProfile {
     key: YuzKey,
-    content: CxdecProfile,
+    content: Option<CxdecProfile>,
+}
+
+#[derive(Clone, Default)]
+pub(super) struct NanaOptions {
+    pub(super) profile: Option<PathBuf>,
+    pub(super) key: Option<PathBuf>,
+    pub(super) generator: Option<PathBuf>,
+}
+
+impl NanaOptions {
+    pub(super) fn load(&self) -> Result<Option<NanaProfile>, Box<dyn std::error::Error>> {
+        match (&self.profile, &self.key, &self.generator) {
+            (Some(profile), None, None) => NanaProfile::load(profile).map(Some),
+            (None, Some(key), generator) => {
+                NanaProfile::from_key_file(key, generator.as_deref()).map(Some)
+            }
+            (None, None, None) => Ok(None),
+            (None, None, Some(_)) => {
+                Err(super::cli_error("--nana-generator requires --nana-key").into())
+            }
+            (Some(_), _, _) => Err(super::cli_error(
+                "--nana-profile conflicts with --nana-key and --nana-generator",
+            )
+            .into()),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -33,8 +67,95 @@ struct ContentFile {
     control_block_file: PathBuf,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GeneratorFile {
+    prolog_order: [u8; 3],
+    even_branch_order: [u8; 8],
+    odd_branch_order: [u8; 6],
+    random_seed: u32,
+}
+
+struct KeyMaterial {
+    key: YuzKey,
+    control_block: Vec<u8>,
+    mask: u32,
+    offset: u32,
+}
+
+fn read_small_file(path: &Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    const MAX_BYTES: usize = 16 * 1024;
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(MAX_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_BYTES {
+        return Err(super::cli_error("Nana input exceeds 16 KiB").into());
+    }
+    Ok(bytes)
+}
+
+fn decode_key_text(bytes: &[u8]) -> Option<String> {
+    if bytes.starts_with(b"\xff\xfe") || bytes.starts_with(b"\xfe\xff") {
+        let body = &bytes[2..];
+        if body.len() % 2 != 0 {
+            return None;
+        }
+        let convert = if bytes[0] == 0xff {
+            u16::from_le_bytes
+        } else {
+            u16::from_be_bytes
+        };
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|pair| convert([pair[0], pair[1]]))
+            .collect();
+        return String::from_utf16(&units).ok();
+    }
+    if let Some(body) = bytes.strip_prefix(b"\xef\xbb\xbf") {
+        return std::str::from_utf8(body).ok().map(str::to_owned);
+    }
+    std::str::from_utf8(bytes)
+        .ok()
+        .map(str::to_owned)
+        .or_else(|| {
+            encoding_rs::SHIFT_JIS
+                .decode_without_bom_handling_and_without_replacement(bytes)
+                .map(|value| value.into_owned())
+        })
+}
+
+fn derive_key_material(line: &str) -> Result<KeyMaterial, Box<dyn std::error::Error>> {
+    if line.is_empty() || line.encode_utf16().count() > 4096 || line.contains('\0') {
+        return Err(super::cli_error("invalid Nana key first line").into());
+    }
+    let text: Vec<u8> = line.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut shake = Shake256::default();
+    shake.update(&text);
+    let mut control_block = vec![0; 4096];
+    XofReader::read(&mut shake.finalize_xof(), &mut control_block);
+
+    let sip_key = control_block[..16].try_into().unwrap();
+    let mut sip = SipHasher24::new_with_key(&sip_key);
+    sip.write(&text);
+    let digest = sip.finish();
+    let digest_words = [digest as u32, (digest >> 32) as u32];
+    let low = digest_words[0];
+    let key = YuzKey(std::array::from_fn(|index| {
+        let start = index * 4;
+        let control_word = u32::from_le_bytes(control_block[start..start + 4].try_into().unwrap());
+        control_word ^ digest_words[index % 2]
+    }));
+    Ok(KeyMaterial {
+        key,
+        control_block,
+        mask: 0x100 + (low & 0x1ff),
+        offset: 0x20 + ((low >> 9) & 0x7f) + ((low >> 16) & 0xff),
+    })
+}
+
 impl NanaProfile {
-    pub(super) fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         let bytes = fs::read(path)?;
         let file: ProfileFile = serde_json::from_slice(&bytes).map_err(|error| {
             super::cli_error(format!(
@@ -62,12 +183,56 @@ impl NanaProfile {
         content.validate()?;
         Ok(Self {
             key: YuzKey(file.name_state),
+            content: Some(content),
+        })
+    }
+
+    fn from_key_file(
+        key_path: &Path,
+        generator_path: Option<&Path>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let key_bytes = read_small_file(key_path)?;
+        let text = decode_key_text(&key_bytes)
+            .ok_or_else(|| super::cli_error("invalid Nana key text encoding"))?;
+        let first_line = text.split(['\r', '\n']).next().unwrap_or_default();
+        let material = derive_key_material(first_line)?;
+        let content = if let Some(path) = generator_path {
+            let generator: GeneratorFile = serde_json::from_slice(&read_small_file(path)?)
+                .map_err(|error| {
+                    super::cli_error(format!(
+                        "invalid Nana generator JSON at line {}, column {}",
+                        error.line(),
+                        error.column()
+                    ))
+                })?;
+            let content = CxdecProfile {
+                mask: material.mask,
+                offset: material.offset,
+                prolog_order: generator.prolog_order,
+                even_branch_order: generator.even_branch_order,
+                odd_branch_order: generator.odd_branch_order,
+                control_block: material.control_block,
+                generator: CxdecGeneratorKind::Cabbage {
+                    random_seed: generator.random_seed,
+                },
+                wrappers: Vec::new(),
+            };
+            content.validate()?;
+            Some(content)
+        } else {
+            None
+        };
+        Ok(Self {
+            key: material.key,
             content,
         })
     }
 
-    pub(super) fn content_engine(&self) -> xp3_brute::Result<CxdecEngine> {
-        CxdecEngine::new(self.content.clone())
+    pub(super) fn content_engine(&self) -> Result<CxdecEngine, Box<dyn std::error::Error>> {
+        let content = self.content.as_ref().ok_or_else(|| {
+            super::cli_error("unpack with --nana-key requires --nana-generator FILE")
+        })?;
+        Ok(CxdecEngine::new(content.clone())?)
     }
 
     pub(super) fn recover_names(
