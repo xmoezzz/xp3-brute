@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -97,8 +97,8 @@ impl NanaProfile {
         let decoder = CxdecNameProfile::Nana { key: self.key };
         let decoded = decoder.decode_payload_bytes_exact(stored, size)?;
         let records = decoder.parse_decoded_names(&decoded)?.records;
-        if records.is_empty() || records.len() != archive.entries.len() {
-            return Err(super::cli_error("dls: name count does not match the File index").into());
+        if records.is_empty() {
+            return Err(super::cli_error("dls: empty filename table").into());
         }
 
         let mut remaining = decoded.as_slice();
@@ -110,10 +110,7 @@ impl NanaProfile {
             let body_size = 8 + name.encode_utf16().count() * 2;
             if record.entry_size != body_size as u64
                 || remaining.get(12 + body_size - 2..12 + body_size) != Some(b"\0\0")
-                || name.chars().any(char::is_control)
-                || name
-                    .split(['/', '\\'])
-                    .any(|part| part.is_empty() || matches!(part, "." | "..") || part.contains(':'))
+                || !valid_name(&name)
             {
                 return Err(super::cli_error("dls: invalid filename record").into());
             }
@@ -125,18 +122,63 @@ impl NanaProfile {
         }
 
         let mut names = Vec::with_capacity(archive.entries.len());
+        let mut output_paths = HashSet::with_capacity(archive.entries.len());
         for (index, entry) in archive.entries.iter().enumerate() {
-            let (adler, name) = names_by_token
-                .remove(&entry.name.to_ascii_lowercase())
-                .ok_or_else(|| {
-                    super::cli_error(format!("dls: no filename token for File {index}"))
-                })?;
-            if entry.adler != Some(adler) {
-                return Err(
-                    super::cli_error(format!("dls: Adler-32 mismatch for File {index}")).into(),
-                );
+            let name = if let Some((adler, name)) =
+                names_by_token.remove(&entry.name.to_ascii_lowercase())
+            {
+                if entry.adler != Some(adler) {
+                    return Err(super::cli_error(format!(
+                        "dls: Adler-32 mismatch for File {index}"
+                    ))
+                    .into());
+                }
+                name
+            } else {
+                // An unmatched hash-shaped name is still a missing record.
+                // Literal names can also carry the protected info flag, so
+                // check their reconstructed bytes against the archive Adler-32.
+                if entry.name.len() == 32 && entry.name.bytes().all(|byte| byte.is_ascii_hexdigit())
+                {
+                    return Err(super::cli_error(format!(
+                        "dls: no filename token for File {index}"
+                    ))
+                    .into());
+                }
+                if !valid_name(&entry.name) {
+                    return Err(super::cli_error(format!(
+                        "dls: invalid direct filename for File {index}"
+                    ))
+                    .into());
+                }
+                let bytes = archive.reconstruct_entry_segments(index)?;
+                if archive.adler_matches(index, &bytes)? != Some(true) {
+                    return Err(super::cli_error(format!(
+                        "dls: direct File {index} did not pass the plaintext Adler-32 check"
+                    ))
+                    .into());
+                }
+                entry.name.clone()
+            };
+            if !output_paths.insert(name.replace('\\', "/").to_lowercase()) {
+                return Err(super::cli_error(format!(
+                    "dls: duplicate output path for File {index}"
+                ))
+                .into());
             }
             names.push(name);
+        }
+        if !names_by_token.is_empty() {
+            return Err(super::cli_error("dls: filename record has no File entry").into());
+        }
+        for path in &output_paths {
+            let mut parent = path.as_str();
+            while let Some((prefix, _)) = parent.rsplit_once('/') {
+                if output_paths.contains(prefix) {
+                    return Err(super::cli_error("dls: conflicting output path").into());
+                }
+                parent = prefix;
+            }
         }
         Ok(OrderedNameRecovery {
             root_index: *root_index,
@@ -149,4 +191,13 @@ impl NanaProfile {
             xor: None,
         })
     }
+}
+
+fn valid_name(name: &str) -> bool {
+    !name.chars().any(char::is_control)
+        && name.split(['/', '\\']).all(|part| {
+            !part.is_empty()
+                && !part.ends_with([' ', '.'])
+                && !part.contains([':', '<', '>', '"', '|', '*', '?'])
+        })
 }
