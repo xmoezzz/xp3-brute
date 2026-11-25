@@ -1,6 +1,10 @@
 use flate2::write::ZlibEncoder;
 use flate2::Compression;
 use serde_json::json;
+use sha3::{
+    digest::{ExtendableOutput, Update, XofReader},
+    Shake256,
+};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -266,4 +270,121 @@ fn nana_profile_rejects_invalid_names_or_content_before_output() {
         assert!(stderr.contains(cause), "expected {cause}: {stderr}");
         assert!(!output_path.exists());
     }
+}
+
+#[test]
+fn nana_explicit_key_inspects_and_unpacks_with_generator_settings() {
+    let directory = TestDirectory::new();
+    let first_line = "Nana synthetic fixture";
+    let key_path = directory.join("fixture.key");
+    let mut key_bytes = vec![0xff, 0xfe];
+    key_bytes.extend(
+        format!("{first_line}\r\nignored second line")
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes),
+    );
+    fs::write(&key_path, key_bytes).unwrap();
+
+    let text: Vec<u8> = first_line
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut shake = Shake256::default();
+    shake.update(&text);
+    let mut control = vec![0; 4096];
+    shake.finalize_xof().read(&mut control);
+    // Values calculated from a separate SipHash reference for the fixture line.
+    let name_state = [
+        0x639b8702, 0x33bc31c1, 0xf806f378, 0xd9298521, 0xfd182aee, 0x23240d18,
+    ];
+    make_fixture(&directory, false, false);
+    let input = directory.join("input.xp3");
+    let archive = xp3_brute::Archive::open(&input).unwrap();
+    let mut bytes = fs::read(&input).unwrap();
+    let descriptor = &archive.root_chunks[archive.indirect_special_roots()[0]];
+    let start = descriptor.inferred_offset.unwrap() as usize;
+    let length = descriptor.inferred_archive_size.unwrap().min(256) as usize;
+    let name_prefix = &mut bytes[start..start + length];
+    NanaDecryptor::new(YuzKey(KEY)).apply(name_prefix);
+    NanaDecryptor::new(YuzKey(name_state)).apply(name_prefix);
+
+    let engine = CxdecEngine::new(CxdecProfile {
+        mask: 417,
+        offset: 195,
+        prolog_order: [0, 1, 2],
+        even_branch_order: [0, 1, 2, 3, 4, 5, 6, 7],
+        odd_branch_order: [0, 1, 2, 3, 4, 5],
+        control_block: control,
+        generator: CxdecGeneratorKind::Cabbage { random_seed: 217 },
+        wrappers: Vec::new(),
+    })
+    .unwrap();
+    for (entry, (_, data)) in archive.entries.iter().zip(FILES) {
+        let segment = &entry.segments[0];
+        let start = segment.archive_offset as usize;
+        let payload = &mut bytes[start..start + data.len()];
+        payload.copy_from_slice(data);
+        engine.apply(0, adler32(data), payload).unwrap();
+    }
+    drop(archive);
+    fs::write(&input, bytes).unwrap();
+    let generator_path = directory.join("generator.json");
+    let generator = json!({
+        "prolog_order": [0, 1, 2],
+        "even_branch_order": [0, 1, 2, 3, 4, 5, 6, 7],
+        "odd_branch_order": [0, 1, 2, 3, 4, 5],
+        "random_seed": 217,
+    });
+    fs::write(&generator_path, serde_json::to_vec(&generator).unwrap()).unwrap();
+    let run_inspect = |key: &Path| {
+        Command::new(env!("CARGO_BIN_EXE_xp3brute"))
+            .arg("inspect")
+            .arg(&input)
+            .arg("--nana-key")
+            .arg(key)
+            .output()
+            .unwrap()
+    };
+    let inspection = run_inspect(&key_path);
+    assert!(
+        inspection.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inspection.stderr)
+    );
+    assert!(String::from_utf8_lossy(&inspection.stdout).contains("name=画像/表情.bin"));
+
+    let run_unpack = |key: &Path, output: &Path, generator: Option<&Path>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_xp3brute"));
+        command.arg("unpack").arg(&input).arg(output);
+        command.args(["--no-progress", "--compute", "cpu"]);
+        if let Some(generator) = generator {
+            command.arg("--nana-generator").arg(generator);
+        }
+        command.arg("--nana-key").arg(key).output().unwrap()
+    };
+    let output = directory.join("extracted");
+    let result = run_unpack(&key_path, &output, Some(&generator_path));
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    for (name, data) in FILES {
+        assert_eq!(fs::read(output.join(name)).unwrap(), data);
+    }
+
+    let missing = directory.join("missing-generator");
+    let rejected = run_unpack(&key_path, &missing, None);
+    assert!(!rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("requires --nana-generator"));
+    assert!(!missing.exists());
+
+    let bad = directory.join("wrong.key");
+    let bad_text = "unrelated synthetic input";
+    fs::write(&bad, bad_text).unwrap();
+    let bad_output = directory.join("wrong-key-output");
+    let rejected = run_unpack(&bad, &bad_output, Some(&generator_path));
+    assert!(!rejected.status.success());
+    assert!(!String::from_utf8_lossy(&rejected.stderr).contains(bad_text));
+    assert!(!bad_output.exists());
 }

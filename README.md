@@ -168,6 +168,19 @@ those tokens. The CLI verifies their plaintext Adler-32 and preserves their
 literal paths. Before extracting, it verifies the supplied content profile
 against the protected entries. Keep application-specific profile data local.
 
+If you already have a Nana startup `.key` text file, pass it explicitly.
+The first line derives the name state, control block, mask and offset. For
+extraction, also supply the Cabbage generator settings as a JSON object with
+`prolog_order`, `even_branch_order`, `odd_branch_order` and `random_seed`.
+
+```bash
+xp3brute inspect fgimage.xp3 --nana-key game.key
+xp3brute unpack fgimage.xp3 out --nana-key game.key --nana-generator generator.json
+```
+
+The same archive name and content checks apply to values derived from the
+key file.
+
 ### MadoCrypt archives and Yakimochi filenames
 
 `unpack` can infer a MadoCrypt seed from protected TLG and KBAD100 headers

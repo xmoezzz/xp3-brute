@@ -298,7 +298,7 @@ fn parse_hx_option(
 
 #[derive(Clone)]
 struct SpecialCliOptions {
-    nana_profile: Option<nana::NanaProfile>,
+    nana: nana::NanaOptions,
     xor_key: Option<String>,
     xor_scope: SpecialXorScope,
     max_xor_period: usize,
@@ -307,7 +307,7 @@ struct SpecialCliOptions {
 impl Default for SpecialCliOptions {
     fn default() -> Self {
         Self {
-            nana_profile: None,
+            nana: nana::NanaOptions::default(),
             xor_key: None,
             xor_scope: SpecialXorScope::Prefix100,
             max_xor_period: 1024,
@@ -331,14 +331,18 @@ fn parse_nana_option(
     i: &mut usize,
     special: &mut SpecialCliOptions,
 ) -> Result<bool, Box<dyn std::error::Error>> {
-    if rest[*i] != "--nana-profile" {
-        return Ok(false);
-    }
+    let option = &rest[*i];
+    let destination = match option.as_str() {
+        "--nana-profile" => &mut special.nana.profile,
+        "--nana-key" => &mut special.nana.key,
+        "--nana-generator" => &mut special.nana.generator,
+        _ => return Ok(false),
+    };
     *i += 1;
     let value = rest
         .get(*i)
-        .ok_or_else(|| cli_error("missing --nana-profile file"))?;
-    special.nana_profile = Some(nana::NanaProfile::load(Path::new(value))?);
+        .ok_or_else(|| cli_error(format!("missing {option} file")))?;
+    *destination = Some(PathBuf::from(value));
     Ok(true)
 }
 
@@ -1605,7 +1609,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 None
             };
-            let ordered_names = if let Some(profile) = special.nana_profile.as_ref() {
+            let ordered_names = if let Some(profile) = special.nana.load()? {
                 Some(profile.recover_names(&archive)?)
             } else {
                 recover_ordered_names_with_hx_options(&archive, &hx, &special, true)?
@@ -7992,9 +7996,11 @@ fn unpack(
     }
 
     // Check the supplied profile before touching the output directory.
-    let (nana_names, nana_engine) = if let Some(profile) = special_options.nana_profile.as_ref() {
-        let names = profile.recover_names(archive)?;
+    let profile = special_options.nana.load()?;
+    let use_nana = profile.is_some();
+    let (nana_names, nana_engine) = if let Some(profile) = profile {
         let engine = profile.content_engine()?;
+        let names = profile.recover_names(archive)?;
         let validation =
             validate_cxdec_params_on_entries(archive, &engine, Some(&names), 0..archive.entries.len())?
                 .filter(|evidence| evidence.adler_matches > 0)
@@ -9457,7 +9463,7 @@ fn unpack(
                 }
             }
             let relative_path = |format| {
-                if special_options.nana_profile.is_some() || mado_filter.is_some() {
+                if use_nana || mado_filter.is_some() {
                     safe_relative_path(&item.name, item.index)
                 } else {
                     solved_item_relative_path(&item, format)
@@ -10974,7 +10980,7 @@ fn usage() {
            filter-apply <module.dll|plugin.tpm> <input> <output> --hash N [--offset N] [--trace-code]\n\
            exe-analyze <game.exe> [--archive data.xp3] [--dump-bootstrap FILE] [--dump-startup FILE]\n\
            inspect <archive> [--special-max-period 1..4096] [--special-xor-key HEX]\n\
-                   [--nana-profile FILE]\n\
+                   [--nana-profile FILE | --nana-key FILE]\n\
                    [--special-xor-scope prefix|whole]\n\
                    [--exe game.exe] [--no-exe-auto] [--hx-key HEX64 --hx-nonce HEX48]\n\
                    [--hx-names HxNames.lst] [--name-dict FILE]\n\
@@ -10993,7 +10999,8 @@ fn usage() {
                   [--special-xor-key HEX --special-xor-scope prefix|whole]\n\
                   [--exe game.exe] [--no-exe-auto] [--hx-key HEX64 --hx-nonce HEX48] [--hx-names HxNames.lst]\n\
                   [--name-dict FILE] [--hx-game-dir DIR] [--no-hx-name-bootstrap]\n\
-                  [--filter-exe game.exe|module.dll|plugin.tpm|game-dir] [--nana-profile FILE] [--restore-names]\n\
+                  [--filter-exe game.exe|module.dll|plugin.tpm|game-dir] [--restore-names]\n\
+                  [--nana-profile FILE | --nana-key FILE --nana-generator FILE]\n\
                   [--unpacker-all] [--tjs emit|decompile|none] [--tlg png|jpg|bmp|none]\n\
                   [--psb all|json|png|jpg|bmp|none] [--pbd json|none] [--amv png|none]\n\
                   [--no-progress] [--verbose]\n\
