@@ -297,7 +297,7 @@ fn nana_explicit_key_inspects_and_unpacks_with_generator_settings() {
     let name_state = [
         0x639b8702, 0x33bc31c1, 0xf806f378, 0xd9298521, 0xfd182aee, 0x23240d18,
     ];
-    make_fixture(&directory, false, false);
+    make_fixture(&directory, false, false, &[]);
     let input = directory.join("input.xp3");
     let archive = xp3_brute::Archive::open(&input).unwrap();
     let mut bytes = fs::read(&input).unwrap();
